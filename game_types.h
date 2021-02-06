@@ -1,4 +1,34 @@
+//
+// NOTE(casey): Compilers
+//
+
+#if !defined(COMPILER_MSVC)
+#define COMPILER_MSVC 0
+#endif
+
+#if !defined(COMPILER_LLVM)
+#define COMPILER_LLVM 0
+#endif
+
+#if !COMPILER_MSVC && !COMPILER_LLVM
+#if _MSC_VER
+#undef COMPILER_MSVC
+#define COMPILER_MSVC 1
+#else
+// TODO(casey): Moar compilerz!!!
+#undef COMPILER_LLVM
+#define COMPILER_LLVM 1
+#endif
+#endif
+
+#if COMPILER_MSVC
 #include <intrin.h>
+#elif COMPILER_LLVM
+#include <x86intrin.h>
+#else
+#error SEE/NEON optimizations are not available for this compiler yet!!!!
+#endif
+
 #include <stdint.h>
 #include <stddef.h>
 #include <limits.h>

@@ -2,11 +2,16 @@
 #include "game_math.h"
 #include "game_intrinsics.h"
 
+// This is required becuase we are doing socket programming while also including windows.h
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 
 #include <windows.h>
 
 // Socket programming on windows.
-#include <winsock.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 
 
 
@@ -144,23 +149,23 @@ internal void d3d12_init(HWND *window) {
   if(SUCCEEDED(dxgi_factory->QueryInterface(IID_PPV_ARGS(&dxgi_factory6)))){
     // This loop setup looks so ugly, but it's how Microsoft shows the example. RIP
     for(UINT adapter_index = 0;
-	DXGI_ERROR_NOT_FOUND != dxgi_factory6->EnumAdapterByGpuPreference(adapter_index,
-									  DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
-									  IID_PPV_ARGS(&hardware_adapter));
-	++adapter_index){
+        DXGI_ERROR_NOT_FOUND != dxgi_factory6->EnumAdapterByGpuPreference(adapter_index,
+                                                                          DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                                                                          IID_PPV_ARGS(&hardware_adapter));
+        ++adapter_index){
             
       DXGI_ADAPTER_DESC1 description;
       hardware_adapter->GetDesc1(&description);
             
       if(description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE){
-	// We don't want the Basic Render Driver adapter.
-	// I also don't think I want to fall back to a software adapter.
-	// That sounds gross.
-	continue;
+        // We don't want the Basic Render Driver adapter.
+        // I also don't think I want to fall back to a software adapter.
+        // That sounds gross.
+        continue;
       }
             
       if(SUCCEEDED(D3D12CreateDevice(hardware_adapter, D3D_FEATURE_LEVEL_11_0, _uuidof(ID3D12Device), NULL))){
-	break;
+        break;
       }
     }
   } else {
@@ -171,12 +176,12 @@ internal void d3d12_init(HWND *window) {
       hardware_adapter->GetDesc1(&description);
             
       if(description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE){
-	// Again, this is the software renderer, we don't want it.
-	continue;
+        // Again, this is the software renderer, we don't want it.
+        continue;
       }
             
       if(SUCCEEDED(D3D12CreateDevice(hardware_adapter, D3D_FEATURE_LEVEL_11_0, _uuidof(ID3D12Device), NULL))){
-	break;
+        break;
       }
     }
   }
@@ -295,7 +300,7 @@ internal void d3d12_load_assets() {
     // This call assumes that we actually got version 1_1.
     assert(D3D12SerializeVersionedRootSignature(&signature_description, &signature, &error) == 0);
     assert(d3d12_device->CreateRootSignature(0, signature->GetBufferPointer(),
-					     signature->GetBufferSize(), IID_PPV_ARGS(&d3d12_signature)) == 0);
+                                             signature->GetBufferSize(), IID_PPV_ARGS(&d3d12_signature)) == 0);
   }
     
   // Create the pipeline state
@@ -311,9 +316,9 @@ internal void d3d12_load_assets() {
         
         
     assert(D3DCompile(d3d12_shader_code, string_length(d3d12_shader_code),
-		      NULL, NULL, NULL, "VSMain", "vs_5_0", compile_flags, 0, &vertex_shader, NULL) == 0);
+                      NULL, NULL, NULL, "VSMain", "vs_5_0", compile_flags, 0, &vertex_shader, NULL) == 0);
     assert(D3DCompile(d3d12_shader_code, string_length(d3d12_shader_code),
-		      NULL, NULL, NULL, "PSMain", "ps_5_0", compile_flags, 0, &pixel_shader, NULL) == 0);
+                      NULL, NULL, NULL, "PSMain", "ps_5_0", compile_flags, 0, &pixel_shader, NULL) == 0);
         
     // Define the vertex input layout.
     D3D12_INPUT_ELEMENT_DESC input_element_descriptions[2] = {};
@@ -348,11 +353,11 @@ internal void d3d12_load_assets() {
     blend_description.IndependentBlendEnable = FALSE;
     D3D12_RENDER_TARGET_BLEND_DESC default_render_target_blend_description =
       {
-	FALSE,FALSE,
-	D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD,
-	D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD,
-	D3D12_LOGIC_OP_NOOP,
-	D3D12_COLOR_WRITE_ENABLE_ALL,
+        FALSE,FALSE,
+        D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD,
+        D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD,
+        D3D12_LOGIC_OP_NOOP,
+        D3D12_COLOR_WRITE_ENABLE_ALL,
       };
     for (UINT i = 0; i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
       blend_description.RenderTarget[i] = default_render_target_blend_description;
@@ -377,7 +382,7 @@ internal void d3d12_load_assets() {
   }
     
   assert(d3d12_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, d3d12_command_allocator,
-					 d3d12_pipeline_state, IID_PPV_ARGS(&d3d12_command_list)) == 0);
+                                         d3d12_pipeline_state, IID_PPV_ARGS(&d3d12_command_list)) == 0);
     
   // Command lists are created in the recording state, but there is nothing to record yet.
   assert(d3d12_command_list->Close() == 0);
@@ -386,11 +391,11 @@ internal void d3d12_load_assets() {
   {
     float aspect_ratio = 1920.0f / 1080.0f;
     d3d12_vertex square_vertices[] = {{ V3(0.25f,  0.25f * aspect_ratio, 0.0f),  V4(0.9f, 0.2f, 0.9f, 1.0f) },
-					{ V3(0.25f, -0.25f * aspect_ratio, 0.0f),  V4(0.9f, 0.2f, 0.9f, 1.0f) },
-					{ V3(-0.25f,  0.25f * aspect_ratio, 0.0f), V4(0.9f, 0.2f, 0.9f, 1.0f) },
-					{ V3(0.25f, -0.25f * aspect_ratio, 0.0f),  V4(0.9f, 0.2f, 0.9f, 1.0f) },
-					{ V3(-0.25f, -0.25f * aspect_ratio, 0.0f), V4(0.9f, 0.2f, 0.9f, 1.0f) },
-					{ V3(-0.25f,  0.25f * aspect_ratio, 0.0f), V4(0.9f, 0.2f, 0.9f, 1.0f) }};
+                                      { V3(0.25f, -0.25f * aspect_ratio, 0.0f),  V4(0.9f, 0.2f, 0.9f, 1.0f) },
+                                      { V3(-0.25f,  0.25f * aspect_ratio, 0.0f), V4(0.9f, 0.2f, 0.9f, 1.0f) },
+                                      { V3(0.25f, -0.25f * aspect_ratio, 0.0f),  V4(0.9f, 0.2f, 0.9f, 1.0f) },
+                                      { V3(-0.25f, -0.25f * aspect_ratio, 0.0f), V4(0.9f, 0.2f, 0.9f, 1.0f) },
+                                      { V3(-0.25f,  0.25f * aspect_ratio, 0.0f), V4(0.9f, 0.2f, 0.9f, 1.0f) }};
         
     UINT vertex_buffer_size = sizeof(square_vertices);
         
@@ -419,8 +424,8 @@ internal void d3d12_load_assets() {
     // over. Please read up on Default Heap usage. An upload heap is used here for 
     // code simplicity and because there are very few verts to actually transfer.
     assert(d3d12_device->CreateCommittedResource(&heap_properties, D3D12_HEAP_FLAG_NONE,
-						 &resource_description, D3D12_RESOURCE_STATE_GENERIC_READ,
-						 NULL, IID_PPV_ARGS(&d3d12_vertex_buffer)) == 0);
+                                                 &resource_description, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                 NULL, IID_PPV_ARGS(&d3d12_vertex_buffer)) == 0);
         
     // Copy the square data to the vertex buffer.
     UINT8 *vertex_data_begin;
@@ -463,8 +468,8 @@ internal void d3d12_load_assets() {
     resource_description.Flags = D3D12_RESOURCE_FLAG_NONE;
     
     assert(d3d12_device->CreateCommittedResource(&heap_properties, D3D12_HEAP_FLAG_NONE,
-						 &resource_description, D3D12_RESOURCE_STATE_GENERIC_READ,
-						 NULL, IID_PPV_ARGS(&d3d12_constant_buffer)) == 0);
+                                                 &resource_description, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                 NULL, IID_PPV_ARGS(&d3d12_constant_buffer)) == 0);
 
     // Describe and create a constant buffer view.
     D3D12_CONSTANT_BUFFER_VIEW_DESC cbv_description = {};
@@ -593,7 +598,7 @@ inline LARGE_INTEGER win32_get_wall_clock(){
 
 inline real32 win32_get_seconds_elapsed(LARGE_INTEGER start, LARGE_INTEGER end){
   real32 result = ((real32)(end.QuadPart - start.QuadPart) /
-		   (real32)global_performance_count_frequency);
+                   (real32)global_performance_count_frequency);
   return result;
 }
 
@@ -624,8 +629,8 @@ internal bool32 win32_do_next_work_queue_entry(platform_work_queue *queue){
     
   if(original_next_entry_to_read != queue->next_entry_to_read){
     uint32 index = InterlockedCompareExchange((LONG volatile *)&queue->next_entry_to_read,
-					      new_next_entry_to_read,
-					      original_next_entry_to_read);
+                                              new_next_entry_to_read,
+                                              original_next_entry_to_read);
         
     if(index == original_next_entry_to_read){
       platform_work_queue_entry entry = queue->entries[index];
@@ -685,18 +690,63 @@ internal void win32_make_queue(platform_work_queue *queue, uint32 thread_count, 
   }
 }
 
-internal void win32_socket_init(){
+#define PORT "28976"
+
+struct win32_network_connection{
+  SOCKET socket;
+  struct sockaddr address; // This is the address of the server.
+  u32 address_length; // This should just be the same value every time.
+};
+
+// We need some sort of win32_packet.
+// Have our own header set up, first X bytes say what type of message it is.
+// CONNECTING,
+// GAME
+
+// NOTE(Trystan): This gets us a connectionless UDP socket, set to our server.
+internal win32_network_connection win32_socket_init(){
   WSADATA wsa_data;
 
   // MAKEWORD(2,0) denotes we want to use winsock 2.0
   assert(WSAStartup(MAKEWORD(2, 0), &wsa_data) == 0);
+  
+  struct addrinfo hints = {};
+  // NOTE(Trystan): AF_INET6 if we want to try IPv6
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_DGRAM;
 
-  // Here we want to setup the connection to the server.
-  // Possible authentication as a certain user.
-  // Maybe even OpenSSL for the authentication.
-  // Then after that we will just be sending all of our keyboard inputs.
-  // And receiving back position data.
+  struct addrinfo *server_info = NULL;
+  // 192.168.2.146 My desktop
+  // 192.168.20.140 wsl2 ubuntu
+  // 192.168.2.98 8GB pi
+  getaddrinfo("192.168.20.140", PORT, &hints, &server_info);
+
+  win32_network_connection connection = {};
+  
+  for(struct addrinfo *p = server_info; p != NULL; p = p->ai_next){
+    connection.socket = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+    if(connection.socket != -1){
+      // We got the socket we wanted.
+      connection.address = *p->ai_addr;
+      connection.address_length = (u32)p->ai_addrlen;
+      break;
+    }
+  }
+
+  assert(connection.socket != 0);
+
+  freeaddrinfo(server_info);
+
+  int yes = 1;
+  ioctlsocket(connection.socket, FIONBIO, (u_long *)&yes);
+  setsockopt(connection.socket, SOL_SOCKET, SO_BROADCAST, (char *)&yes, sizeof(int));
+
+  return connection;
 }
+
+internal void win32_send_packet(win32_network_connection connection, char *message){
+  sendto(connection.socket, message, string_length(message), 0, &connection.address, connection.address_length);
+};
 
 internal LRESULT CALLBACK
 Win32MainWindowCallback(HWND Window, UINT Message, WPARAM WParam, LPARAM LParam) {
@@ -734,13 +784,13 @@ internal void win32_process_pending_messages(game_controller_input *controller) 
             
       DWORD last_message = 0;
       for(u32 skip_index = 0; skip_index < array_count(skip_messages); ++skip_index){
-	DWORD skip = skip_messages[skip_index];
-	got_message = PeekMessage(&message, 0, last_message, skip - 1, PM_REMOVE);
-	if(got_message){
-	  break;
-	}
+        DWORD skip = skip_messages[skip_index];
+        got_message = PeekMessage(&message, 0, last_message, skip - 1, PM_REMOVE);
+        if(got_message){
+          break;
+        }
                 
-	last_message = skip + 1;
+        last_message = skip + 1;
       }
     }
         
@@ -751,7 +801,7 @@ internal void win32_process_pending_messages(game_controller_input *controller) 
     switch(message.message) {
     case WM_QUIT:
       {
-	global_running = false;
+        global_running = false;
       } break;
       
     case WM_SYSKEYDOWN:
@@ -759,35 +809,35 @@ internal void win32_process_pending_messages(game_controller_input *controller) 
     case WM_KEYDOWN:
     case WM_KEYUP:
       {
-	uint32 vk_code = (uint32)message.wParam;
+        uint32 vk_code = (uint32)message.wParam;
 
-	// TODO(Trystan): If we care about alt or shift, we have to check the lParam.
+        // TODO(Trystan): If we care about alt or shift, we have to check the lParam.
 
-	b32 was_down = ((message.lParam & (1 << 30)) != 0);
-	b32 is_down = ((message.lParam & (1UL << 31)) == 0);
-	if(was_down != is_down){
-	  if(vk_code == 'W'){
-	    win32_process_keyboard_message(&controller->move_up, is_down);
-	  }
-	  else if(vk_code == 'A'){
-	    win32_process_keyboard_message(&controller->move_left, is_down);
-	  }
-	  else if(vk_code == 'S'){
-	    win32_process_keyboard_message(&controller->move_down, is_down);
-	  }
-	  else if(vk_code == 'D'){
-	    win32_process_keyboard_message(&controller->move_right, is_down);
-	  }
-	  else if(vk_code == VK_ESCAPE){
-	    win32_process_keyboard_message(&controller->back, is_down);
-	  }
-	}
+        b32 was_down = ((message.lParam & (1 << 30)) != 0);
+        b32 is_down = ((message.lParam & (1UL << 31)) == 0);
+        if(was_down != is_down){
+          if(vk_code == 'W'){
+            win32_process_keyboard_message(&controller->move_up, is_down);
+          }
+          else if(vk_code == 'A'){
+            win32_process_keyboard_message(&controller->move_left, is_down);
+          }
+          else if(vk_code == 'S'){
+            win32_process_keyboard_message(&controller->move_down, is_down);
+          }
+          else if(vk_code == 'D'){
+            win32_process_keyboard_message(&controller->move_right, is_down);
+          }
+          else if(vk_code == VK_ESCAPE){
+            win32_process_keyboard_message(&controller->back, is_down);
+          }
+        }
       } break;
             
     default:
       {
-	TranslateMessage(&message);
-	DispatchMessage(&message);
+        TranslateMessage(&message);
+        DispatchMessage(&message);
       } break;
     }
   }
@@ -815,11 +865,12 @@ extern "C" int __stdcall WinMainCRTStartup() {
     
   if(RegisterClassA(&window_class)){
     HWND window = CreateWindowExA(0, window_class.lpszClassName, "The Game", WS_OVERLAPPEDWINDOW|WS_VISIBLE,
-				  CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
-				  0, 0, instance, 0);
+                                  CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+                                  0, 0, instance, 0);
         
     if(window){
-      win32_socket_init();
+      win32_network_connection connection = win32_socket_init();
+      
             
       d3d12_init(&window);
       d3d12_load_assets();
@@ -831,8 +882,8 @@ extern "C" int __stdcall WinMainCRTStartup() {
       uint32 thread_count = logical_processor_count - 1;
             
       // TODO(Trystan): Again we want to take this out of a larger startup memory buffer.
-      win32_thread_startup *thread_startups = (win32_thread_startup *)VirtualAlloc(0, thread_count,
-										   MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
+      win32_thread_startup *thread_startups = (win32_thread_startup *)VirtualAlloc(0, thread_count * sizeof(win32_thread_startup),
+                                                                                   MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
             
       platform_work_queue thread_queue = {};
       win32_make_queue(&thread_queue, thread_count, thread_startups);
@@ -860,61 +911,61 @@ extern "C" int __stdcall WinMainCRTStartup() {
       f32 target_seconds_per_frame = (f32)expected_frames_per_update / (f32)monitor_refresh_rate;
             
       while(global_running){
-	new_input->dt_for_frame = target_seconds_per_frame;
+        new_input->dt_for_frame = target_seconds_per_frame;
 
-	game_controller_input *old_controller = &old_input->controller;
-	game_controller_input *new_controller = &new_input->controller;
-	*new_controller = {};
-	new_controller->is_connected = true;
-	// We need to carry over the button state every time to ensure half_transition_count updates properly.
-	for(uint32 button_index = 0; button_index < array_count(new_controller->buttons); ++button_index){
-	  new_controller->buttons[button_index].ended_down = old_controller->buttons[button_index].ended_down;
-	}
+        game_controller_input *old_controller = &old_input->controller;
+        game_controller_input *new_controller = &new_input->controller;
+        *new_controller = {};
+        new_controller->is_connected = true;
+        // We need to carry over the button state every time to ensure half_transition_count updates properly.
+        for(uint32 button_index = 0; button_index < array_count(new_controller->buttons); ++button_index){
+          new_controller->buttons[button_index].ended_down = old_controller->buttons[button_index].ended_down;
+        }
 
-	// Get input, update game simulation, render.
-	win32_process_pending_messages(&new_input->controller);
+        // Get input, update game simulation, render.
+        win32_process_pending_messages(&new_input->controller);
 
-	// TODO(Trystan): Yeet all button processing out of here into the game layer.
-	f32 square_speed = 1.0f;
-	if(is_down(new_input->controller.move_left)){
-	  square_position.x -= square_speed * new_input->dt_for_frame;
-	}
-	if(is_down(new_input->controller.move_right)){
-	  square_position.x += square_speed * new_input->dt_for_frame;
-	}
-	if(is_down(new_input->controller.move_up)){
-	  square_position.y += (square_speed * new_input->dt_for_frame) * aspect_ratio;
-	}
-	if(is_down(new_input->controller.move_down)){
-	  square_position.y -= square_speed * new_input->dt_for_frame * aspect_ratio;
-	}
-	if(was_pressed(new_input->controller.back)){
-	  global_running = false;
-	}
+        // TODO(Trystan): Yeet all button processing out of here into the game layer.
+        f32 square_speed = 1.0f;
+        if(is_down(new_input->controller.move_left)){
+          square_position.x -= square_speed * new_input->dt_for_frame;
+        }
+        if(is_down(new_input->controller.move_right)){
+          square_position.x += square_speed * new_input->dt_for_frame;
+        }
+        if(is_down(new_input->controller.move_up)){
+          square_position.y += (square_speed * new_input->dt_for_frame) * aspect_ratio;
+        }
+        if(is_down(new_input->controller.move_down)){
+          square_position.y -= square_speed * new_input->dt_for_frame * aspect_ratio;
+        }
+        if(was_pressed(new_input->controller.back)){
+          global_running = false;
+        }
 
-	if(square_position.x > square_bounding_box.x) square_position.x = square_bounding_box.x;
-	if(square_position.x < -square_bounding_box.x) square_position.x = -square_bounding_box.x;
-	if(square_position.y > square_bounding_box.y) square_position.y = square_bounding_box.y;
-	if(square_position.y < -square_bounding_box.y) square_position.y = -square_bounding_box.y;
+        if(square_position.x > square_bounding_box.x) square_position.x = square_bounding_box.x;
+        if(square_position.x < -square_bounding_box.x) square_position.x = -square_bounding_box.x;
+        if(square_position.y > square_bounding_box.y) square_position.y = square_bounding_box.y;
+        if(square_position.y < -square_bounding_box.y) square_position.y = -square_bounding_box.y;
 
-	d3d12_update_square_position(square_position);
+        d3d12_update_square_position(square_position);
 	
-	d3d12_on_render();
+        d3d12_on_render();
 
 
-	game_input *temp = new_input;
-	new_input = old_input;
-	old_input = temp;
+        game_input *temp = new_input;
+        new_input = old_input;
+        old_input = temp;
 
-	LARGE_INTEGER end_counter = win32_get_wall_clock();
-	f32 measured_seconds_per_frame = win32_get_seconds_elapsed(last_counter, end_counter);
-	f32 exact_target_frames_per_update = measured_seconds_per_frame * (f32)monitor_refresh_rate;
-	u32 new_expected_frames_per_update = round_real32_to_int32(exact_target_frames_per_update);
-	expected_frames_per_update = new_expected_frames_per_update;
+        LARGE_INTEGER end_counter = win32_get_wall_clock();
+        f32 measured_seconds_per_frame = win32_get_seconds_elapsed(last_counter, end_counter);
+        f32 exact_target_frames_per_update = measured_seconds_per_frame * (f32)monitor_refresh_rate;
+        u32 new_expected_frames_per_update = round_real32_to_int32(exact_target_frames_per_update);
+        expected_frames_per_update = new_expected_frames_per_update;
 
-	target_seconds_per_frame = measured_seconds_per_frame;
+        target_seconds_per_frame = measured_seconds_per_frame;
 
-	last_counter = end_counter;
+        last_counter = end_counter;
       }
     }
   }

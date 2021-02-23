@@ -1,6 +1,7 @@
 #include "game_platform.h"
 #include "game_math.h"
 #include "game_intrinsics.h"
+#include "game_network.h"
 
 // This is required becuase we are doing socket programming while also including windows.h
 #ifndef WIN32_LEAN_AND_MEAN
@@ -691,6 +692,8 @@ internal void win32_make_queue(platform_work_queue *queue, uint32 thread_count, 
 }
 
 #define PORT "28976"
+// Time in ms, 60 updates per second.
+#define PACKET_SEND_RATE 16
 
 struct win32_network_connection{
   SOCKET socket;
@@ -717,9 +720,9 @@ internal win32_network_connection win32_socket_init(){
 
   struct addrinfo *server_info = NULL;
   // 192.168.2.146 My desktop
-  // 192.168.20.140 wsl2 ubuntu
+  // 192.168.20.140 wsl2 ubuntu // This changes at startup RIP
   // 192.168.2.98 8GB pi
-  getaddrinfo("192.168.20.140", PORT, &hints, &server_info);
+  getaddrinfo("192.168.101.247", PORT, &hints, &server_info);
 
   win32_network_connection connection = {};
   
@@ -744,9 +747,32 @@ internal win32_network_connection win32_socket_init(){
   return connection;
 }
 
-internal void win32_send_packet(win32_network_connection connection, char *message){
-  sendto(connection.socket, message, string_length(message), 0, &connection.address, connection.address_length);
+internal void win32_send_packet(win32_network_connection *connection, network_buffer *buffer){
+  sendto(connection->socket, (char *)buffer->data, buffer->data_length, 0, &connection->address, connection->address_length);
 };
+
+internal int win32_socket_wait(win32_network_connection *connection, u32 timeout){
+  WSAPOLLFD poll_socket = {};
+
+  poll_socket.fd = connection->socket;
+  poll_socket.events = POLLIN;
+
+  int poll_count = WSAPoll(&poll_socket, 1, timeout);
+
+  if(poll_count == 0){
+    return 0;
+  }
+
+  if(poll_socket.revents & POLLIN){
+    return poll_count;
+  }
+
+  return 0;
+}
+
+internal void win32_get_raw_packet_data(win32_network_connection *connection, network_buffer *buffer){
+  buffer->data_length = recvfrom(connection->socket, (char *)buffer->data, MAX_DATA_LENGTH, 0, 0, 0);
+}
 
 internal LRESULT CALLBACK
 Win32MainWindowCallback(HWND Window, UINT Message, WPARAM WParam, LPARAM LParam) {
@@ -870,8 +896,12 @@ extern "C" int __stdcall WinMainCRTStartup() {
         
     if(window){
       win32_network_connection connection = win32_socket_init();
+
+      network_buffer connecting_message = {};
+      pack_uint32(&connecting_message, (u32)network_packet_type_connect);
+      win32_send_packet(&connection, &connecting_message);
+      // The server then sends back a packet containing the packet type header + the assigned ID.
       
-            
       d3d12_init(&window);
       d3d12_load_assets();
 
@@ -909,9 +939,16 @@ extern "C" int __stdcall WinMainCRTStartup() {
       LARGE_INTEGER last_counter = win32_get_wall_clock();
       u32 expected_frames_per_update = 1;
       f32 target_seconds_per_frame = (f32)expected_frames_per_update / (f32)monitor_refresh_rate;
-            
+
+      f32 time_since_last_sent_packet = 0.0f;
+
+      u64 last_received_packet_number = 0;
+
+      network_client_normal_packet normal_outgoing_packet = {};
+
       while(global_running){
         new_input->dt_for_frame = target_seconds_per_frame;
+        time_since_last_sent_packet += new_input->dt_for_frame;
 
         game_controller_input *old_controller = &old_input->controller;
         game_controller_input *new_controller = &new_input->controller;
@@ -925,19 +962,74 @@ extern "C" int __stdcall WinMainCRTStartup() {
         // Get input, update game simulation, render.
         win32_process_pending_messages(&new_input->controller);
 
+        int wait_condition = win32_socket_wait(&connection, 0);
+        if(wait_condition){
+          network_buffer buffer = {};
+          win32_get_raw_packet_data(&connection, &buffer);
+          if(buffer.data_length){
+            uint32 index = 0;
+            uint32 packet_type = unpack_uint32(&buffer);
+            switch(packet_type){
+            case network_packet_type_connect:
+              {
+                // Connecting packet contains our new ID that we use to refer to ourselves.
+                normal_outgoing_packet.player_id = unpack_uint32(&buffer);
+              } break;
+            case network_packet_type_normal:
+              {
+                // Contains position data about all players.
+                network_server_normal_packet server_data = {};
+                server_data.packet_number = unpack_uint64(&buffer);
+                server_data.player_count = unpack_uint32(&buffer);
+                if(last_received_packet_number > server_data.packet_number){
+                  break;
+                }
+                
+                for(u32 i = 0; i < server_data.player_count; ++i){
+                  server_data.player_info[i].player_id = unpack_uint32(&buffer);
+                  u32 encoded_x = unpack_uint32(&buffer);
+                  f32 x = (f32)net_decode_32(encoded_x);
+                  server_data.player_info[i].x = x;
+                  u32 encoded_y = unpack_uint32(&buffer);
+                  f32 y = (f32)net_decode_32(encoded_y);
+                  server_data.player_info[i].y = y;
+                }
+
+                for(u32 i = 0; i < server_data.player_count; ++i){
+                  // At the moment, ignore our own packet. Do some type of correction if the player is too out of sync.
+                  if(server_data.player_info[i].player_id == normal_outgoing_packet.player_id){
+                    continue;
+                  }
+
+                  // Draw square at position.
+                  
+                }
+                last_received_packet_number = server_data.packet_number;
+              } break;
+            default:
+              // Invalid packet type.
+              break;
+            }
+          }
+        }
+
         // TODO(Trystan): Yeet all button processing out of here into the game layer.
         f32 square_speed = 1.0f;
         if(is_down(new_input->controller.move_left)){
           square_position.x -= square_speed * new_input->dt_for_frame;
+          normal_outgoing_packet.button_durations[network_button_type_left] += new_input->dt_for_frame;
         }
         if(is_down(new_input->controller.move_right)){
           square_position.x += square_speed * new_input->dt_for_frame;
+          normal_outgoing_packet.button_durations[network_button_type_right] += new_input->dt_for_frame;
         }
         if(is_down(new_input->controller.move_up)){
           square_position.y += (square_speed * new_input->dt_for_frame) * aspect_ratio;
+          normal_outgoing_packet.button_durations[network_button_type_up] += new_input->dt_for_frame;
         }
         if(is_down(new_input->controller.move_down)){
           square_position.y -= square_speed * new_input->dt_for_frame * aspect_ratio;
+          normal_outgoing_packet.button_durations[network_button_type_down] += new_input->dt_for_frame;
         }
         if(was_pressed(new_input->controller.back)){
           global_running = false;
@@ -951,6 +1043,23 @@ extern "C" int __stdcall WinMainCRTStartup() {
         d3d12_update_square_position(square_position);
 	
         d3d12_on_render();
+
+        // NOTE(Trystan): We want to send updates to the server 60 times a second.
+        if(time_since_last_sent_packet > 0.167f && normal_outgoing_packet.player_id != 0){
+          time_since_last_sent_packet = 0.0f;
+          network_buffer raw_packet = {};
+          pack_uint32(&raw_packet, (u32)network_packet_type_normal);
+          pack_uint32(&raw_packet, normal_outgoing_packet.player_id);
+          for(int i = 0; i < network_button_type_count; ++i){
+            uint32 encoded_duration = (u32)net_encode_32(normal_outgoing_packet.button_durations[i]);
+            pack_uint32(&raw_packet, encoded_duration);
+
+            // reset for the next packet. Keeping player_id
+            normal_outgoing_packet.button_durations[i] = 0.0f;
+          }
+          
+          win32_send_packet(&connection, &raw_packet);
+        }
 
 
         game_input *temp = new_input;
@@ -967,6 +1076,12 @@ extern "C" int __stdcall WinMainCRTStartup() {
 
         last_counter = end_counter;
       }
+      
+      // Exiting cleanup.
+      network_buffer disconnect_message = {};
+      pack_uint32(&disconnect_message, (u32)network_packet_type_disconnect);
+      pack_uint32(&disconnect_message, normal_outgoing_packet.player_id);
+      win32_send_packet(&connection, &disconnect_message);
     }
   }
   

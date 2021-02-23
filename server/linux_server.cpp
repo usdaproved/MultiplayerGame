@@ -18,7 +18,11 @@
 #include <string.h>
 #include <poll.h>
 
+#include <time.h>
+
 #include "../game_types.h"
+#include "../game_math.h"
+#include "../game_network.h"
 
 #define DAEMON_MODE 0
 
@@ -57,14 +61,36 @@ void * get_in_addr(struct sockaddr *sa){
   return &(((struct sockaddr_in6 *)sa)->sin6_addr);
 }
 
-struct square {
-  v3 position;
-  b32 connected;
-};
-
 #define TOTAL_CONNECTIONS 8
 
-volatile square squares[TOTAL_CONNECTIONS];
+// These map directly to the host->clients.
+v3 squares[TOTAL_CONNECTIONS] = {};
+
+// Copied over from the win32 code.
+f32 aspect_ratio = (1920.0f / 1080.0f);
+v2 square_bounding_box = V2(1 - (0.5f / 2.0f), 1 - ((0.5f * aspect_ratio) / 2.0f));
+f32 square_speed = 1.0f;
+
+void process_player_input(network_client_normal_packet *data){
+  v3 *square = &squares[data->player_id];
+  if(data->button_durations[network_button_type_left]){
+    square->x -= square_speed * data->button_durations[network_button_type_left];
+  }
+  if(data->button_durations[network_button_type_right]){
+    square->x += square_speed * data->button_durations[network_button_type_right];
+  }
+  if(data->button_durations[network_button_type_up]){
+    square->y += (square_speed * data->button_durations[network_button_type_up]) * aspect_ratio;
+  }
+  if(data->button_durations[network_button_type_down]){
+    square->y -= (square_speed * data->button_durations[network_button_type_down]) * aspect_ratio;
+  }
+
+  if(square->x > square_bounding_box.x) square->x = square_bounding_box.x;
+  if(square->x < -square_bounding_box.x) square->x = -square_bounding_box.x;
+  if(square->y > square_bounding_box.y) square->y = square_bounding_box.y;
+  if(square->y < -square_bounding_box.y) square->y = -square_bounding_box.y;
+}
 
 // A few things to think about structure-wise:
 // If we wait on all connections and then only act once we receive input,
@@ -80,25 +106,14 @@ struct network_client{
   network_host *host;
   struct sockaddr address; // Address of the client.
   u32 address_length;
+  b32 is_connected;
 };
 
 struct network_host{
   int socket;
   network_client *clients;
-  int client_count;
-};
-
-// NOTE(Trystan): Maybe we can just get away with using the buffer for everything.
-struct network_packet{
-  uint8 *data;
-  uint32 data_length;
-};
-
-// NOTE(Trystan): Just getting network_buffer to a round 256 bits, not thought out at all.
-#define MAX_DATA_LENGTH 224
-struct network_buffer{
-  char data[MAX_DATA_LENGTH];
-  uint32 data_length;
+  u32 client_count;
+  u32 connected_client_count;
 };
 
 network_host * host_create(int client_count){
@@ -143,31 +158,109 @@ network_host * host_create(int client_count){
   for(current_client = host->clients;
       current_client < &host->clients[host->client_count];
       ++current_client){
-
     current_client->host = host;
   }
 
   return host;
 }
 
-void socket_receive(int socket, network_buffer *buffer){
-  struct sockaddr_storage sending_address;
+void send_packet(network_client *client, network_buffer *buffer){
+  sendto(client->host->socket, buffer->data, buffer->data_length, 0, &client->address, client->address_length);
+}
+
+void handle_incoming_packets(network_host *host){
+  struct sockaddr sending_address;
   socklen_t address_length = sizeof(sending_address);
 
-  
-  int received_length = recvfrom(socket, buffer->data, MAX_DATA_LENGTH-1, 0,
-                                 (struct sockaddr *)&sending_address, &address_length);
+  network_buffer buffer = {};
+  int received_length = recvfrom(host->socket, buffer.data, MAX_DATA_LENGTH, 0,
+                                 &sending_address, &address_length);
 
-  if(received_length > 0){
-    char s[INET_ADDRSTRLEN];
-    printf("Got packet from %s\n", inet_ntop(sending_address.ss_family,
-                                             get_in_addr((struct sockaddr *)&sending_address),
-                                             s, sizeof(s)));
-    printf("Packet is %d bytes long\n", received_length);
-    buffer->data[received_length] = '\0';
-    printf("Packet contains \"%s\"\n", buffer->data);
+  if(!buffer.data){
+    return;
+  }
+  uint32 packet_type = unpack_uint32(&buffer);
+  switch(packet_type){
+  case network_packet_type_connect:
+    {
+      // NOTE(Trystan): This isn't an error, we don't want the first position to be used.
+      // We want 0 to be the uninitalized ID state, so we don't want that to ever be handed out.
+      int insertion_index = 0;
+      for(int i = 1; i < host->client_count; ++i){
+        if(!host->clients[i].is_connected){
+          insertion_index = i;
+          break;
+        }
+      }
+
+      if(!insertion_index){
+        printf("Attempted connection failed. Server full.\n");
+        break;
+      }
+      
+      printf("New connection received\n");
+      ++host->connected_client_count;
+      host->clients[insertion_index].address = sending_address;
+      host->clients[insertion_index].address_length = address_length;
+      host->clients[insertion_index].is_connected = 1;
+      
+      network_buffer message = {};
+      pack_uint32(&message, (u32)network_packet_type_connect);
+      pack_uint32(&message, (u32)insertion_index);
+      send_packet(&host->clients[insertion_index], &message);
+    } break;
+  case network_packet_type_normal:
+    {
+      // Figure out who sent the packet,
+      // update their square.
+      network_client_normal_packet packet = {};
+      packet.player_id = unpack_uint32(&buffer);
+      // If a message comes through from a disconnected client, don't process.
+      if(!host->clients[packet.player_id].is_connected){
+        break;
+      }
+      for(int i = 0; i < network_button_type_count; ++i){
+        u32 encoded_duration = unpack_uint32(&buffer);
+        f32 duration = net_decode_32(encoded_duration);
+        packet.button_durations[i] = duration;
+      }
+      process_player_input(&packet);
+    } break;
+  case network_packet_type_disconnect:
+    {
+      // Clear out the previously used client slot.
+      uint32 client_id = unpack_uint32(&buffer);
+      if(!client_id || !host->clients[client_id].is_connected){
+        break;
+      }
+      
+      printf("Connection ended\n");
+      --host->connected_client_count;
+      host->clients[client_id] = {};
+      host->clients[client_id].host = host;
+      squares[client_id] = {};
+    } break;
+  default:
+    printf("invalid packet\n");
+    break;
   }
 }
+
+// Idea for the layout of a packet the server sends:
+// u64 packet_number // If an older number is received than previous it's stale.
+// u32 player_count
+// [ // This repeats player_count times
+//   u32 player_id
+//   f32 x
+//   f32 y
+// ]
+
+// On the opposite side here is the client sent packet:
+// u32 packet_type // connecting or regular message
+// --- That is all a connecting packet will contain, below is when regular messages
+// u32 player_id
+// f32 x
+// f32 y
 
 int socket_wait(int socket, u32 timeout){
   struct pollfd poll_socket;
@@ -175,6 +268,7 @@ int socket_wait(int socket, u32 timeout){
   poll_socket.fd = socket;
   poll_socket.events = POLL_IN;
 
+  // NOTE(Trystan): poll_count will only ever be 1 or 0. As we are only polling 1 socket.
   int poll_count = poll(&poll_socket, 1, timeout);
 
   if (poll_count == 0){
@@ -182,10 +276,29 @@ int socket_wait(int socket, u32 timeout){
   }
 
   if (poll_socket.revents & POLL_IN){
-    return (int)POLL_IN;
+    return poll_count;
   }
 
   return 0;
+}
+
+inline struct timespec linux_get_wall_clock(){
+  struct timespec result;
+  clock_gettime(CLOCK_MONOTONIC, &result);
+  return result;
+}
+
+inline f32 linux_get_seconds_elapsed(struct timespec start, struct timespec end){
+  struct timespec temp = {};
+  temp.tv_sec  = end.tv_sec  - start.tv_sec;
+  temp.tv_nsec = end.tv_nsec - start.tv_nsec;
+  if (temp.tv_nsec < 0) {
+    --temp.tv_sec;
+    temp.tv_nsec += 1000000000L;
+  }
+  
+  f32 result = temp.tv_sec + (f32)(temp.tv_nsec / 1000000000.0f);
+  return result;
 }
 
 int main(int argc, char **argv){
@@ -240,13 +353,65 @@ int main(int argc, char **argv){
 
   printf("server: waiting for connections...\n");
 
+  struct timespec last_counter = linux_get_wall_clock();
+
+  uint32 tick_rate = 60;
+
+  u32 expected_frames_per_update = 1;
+  f32 target_seconds_per_tick = (f32)expected_frames_per_update / (f32)tick_rate;
+  f32 time_since_last_packet_sent = 0.0f;
+  u64 packet_number = 0;
   for(;;){
-    // Check every 100 milliseconds if a message is pending.
-    int wait_condition = socket_wait(host->socket, 100);
-    if(wait_condition == POLL_IN){
-      network_buffer buffer = {};
-      socket_receive(host->socket, &buffer);
+    f32 dt_for_tick = target_seconds_per_tick;
+    time_since_last_packet_sent += dt_for_tick;
+    
+    f32 wait_time = (0.167f - dt_for_tick) * 1000; // 1000 gets us to ms
+    if(wait_time < 0.0f) wait_time = 0.0f;
+    int is_incoming_packet = socket_wait(host->socket, 10);
+    if(is_incoming_packet){
+      handle_incoming_packets(host);
     }
+
+    if(time_since_last_packet_sent > 0.167f){
+      time_since_last_packet_sent = 0.0f;
+      if(!host->connected_client_count){
+        
+      }
+      packet_number += 1;
+      // construct a packet to send out to all clients.
+      network_buffer raw_packet = {};
+      pack_uint32(&raw_packet, (u32)network_packet_type_normal);
+      pack_uint64(&raw_packet, packet_number);
+      pack_uint32(&raw_packet, host->connected_client_count);
+      for(u32 i = 1; i < host->client_count; ++i){
+        if(!host->clients[i].is_connected){
+          continue;
+        }
+
+        // The player_id
+        pack_uint32(&raw_packet, i);
+        uint32 encoded_x = (u32)net_encode_32(squares[i].x);
+        pack_uint32(&raw_packet, encoded_x);
+        uint32 encoded_y = (u32)net_encode_32(squares[i].y);
+        pack_uint32(&raw_packet, encoded_y);
+      }
+      // Now the packet has been fully constructed
+      // Send out to all connected clients.
+      for(u32 i = 1; i < host->client_count; ++i){
+        if(!host->clients[i].is_connected){
+          continue;
+        }
+
+        send_packet(&host->clients[i], &raw_packet);
+      }
+    }
+
+    struct timespec end_counter = linux_get_wall_clock();
+    f32 measured_seconds_per_tick = linux_get_seconds_elapsed(last_counter, end_counter);
+
+    target_seconds_per_tick = measured_seconds_per_tick;
+
+    last_counter = end_counter;
   }
 
   return 0;

@@ -24,7 +24,7 @@
 #include "../game_math.h"
 #include "../game_network.h"
 
-#define DAEMON_MODE 0
+#define DAEMON_MODE 1
 
 #define PORT "28976"
 
@@ -62,14 +62,15 @@ void * get_in_addr(struct sockaddr *sa){
 }
 
 #define TOTAL_CONNECTIONS 8
+#define SQUARE_LENGTH 300
+#define SCREEN_WIDTH 1920
+#define SCREEN_HEIGHT 1080
 
 // These map directly to the host->clients.
 v3 squares[TOTAL_CONNECTIONS] = {};
 
 // Copied over from the win32 code.
-f32 aspect_ratio = (1920.0f / 1080.0f);
-v2 square_bounding_box = V2(1 - (0.5f / 2.0f), 1 - ((0.5f * aspect_ratio) / 2.0f));
-f32 square_speed = 1.0f;
+f32 square_speed = 1000.0f;
 
 void process_player_input(network_client_normal_packet *data){
   v3 *square = &squares[data->player_id];
@@ -80,16 +81,16 @@ void process_player_input(network_client_normal_packet *data){
     square->x += square_speed * data->button_durations[network_button_type_right];
   }
   if(data->button_durations[network_button_type_up]){
-    square->y += (square_speed * data->button_durations[network_button_type_up]) * aspect_ratio;
+    square->y -= (square_speed * data->button_durations[network_button_type_up]);
   }
   if(data->button_durations[network_button_type_down]){
-    square->y -= (square_speed * data->button_durations[network_button_type_down]) * aspect_ratio;
+    square->y += (square_speed * data->button_durations[network_button_type_down]);
   }
 
-  if(square->x > square_bounding_box.x) square->x = square_bounding_box.x;
-  if(square->x < -square_bounding_box.x) square->x = -square_bounding_box.x;
-  if(square->y > square_bounding_box.y) square->y = square_bounding_box.y;
-  if(square->y < -square_bounding_box.y) square->y = -square_bounding_box.y;
+  if(square->x > SCREEN_WIDTH - SQUARE_LENGTH) square->x = SCREEN_WIDTH - SQUARE_LENGTH;
+  if(square->x < 0) square->x = 0;
+  if(square->y > SCREEN_HEIGHT - SQUARE_LENGTH) square->y = SCREEN_HEIGHT - SQUARE_LENGTH;
+  if(square->y < 0) square->y = 0;
 }
 
 // A few things to think about structure-wise:
@@ -107,6 +108,7 @@ struct network_client{
   struct sockaddr address; // Address of the client.
   u32 address_length;
   b32 is_connected;
+  f32 time_since_last_message;
 };
 
 struct network_host{
@@ -194,15 +196,16 @@ void handle_incoming_packets(network_host *host){
       }
 
       if(!insertion_index){
-        printf("Attempted connection failed. Server full.\n");
+        syslog(LOG_NOTICE, "Attempted connection failed. Server full.\n");
         break;
       }
       
-      printf("New connection received\n");
+      syslog(LOG_NOTICE, "New connection received\n");
       ++host->connected_client_count;
       host->clients[insertion_index].address = sending_address;
       host->clients[insertion_index].address_length = address_length;
       host->clients[insertion_index].is_connected = 1;
+      host->clients[insertion_index].time_since_last_message = 0.0f;
       
       network_buffer message = {};
       pack_uint32(&message, (u32)network_packet_type_connect);
@@ -219,6 +222,7 @@ void handle_incoming_packets(network_host *host){
       if(!host->clients[packet.player_id].is_connected){
         break;
       }
+      host->clients[packet.player_id].time_since_last_message = 0.0f;
       for(int i = 0; i < network_button_type_count; ++i){
         u32 encoded_duration = unpack_uint32(&buffer);
         f32 duration = net_decode_32(encoded_duration);
@@ -234,14 +238,14 @@ void handle_incoming_packets(network_host *host){
         break;
       }
       
-      printf("Connection ended\n");
+      syslog(LOG_NOTICE, "Connection ended\n");
       --host->connected_client_count;
       host->clients[client_id] = {};
       host->clients[client_id].host = host;
       squares[client_id] = {};
     } break;
   default:
-    printf("invalid packet\n");
+    syslog(LOG_NOTICE, "invalid packet\n");
     break;
   }
 }
@@ -351,7 +355,7 @@ int main(int argc, char **argv){
   // Run the server at 128 ticks, sending out packets 60 times per second.
   network_host *host = host_create(TOTAL_CONNECTIONS);
 
-  printf("server: waiting for connections...\n");
+  syslog(LOG_NOTICE, "server: waiting for connections...\n");
 
   struct timespec last_counter = linux_get_wall_clock();
 
@@ -361,15 +365,42 @@ int main(int argc, char **argv){
   f32 target_seconds_per_tick = (f32)expected_frames_per_update / (f32)tick_rate;
   f32 time_since_last_packet_sent = 0.0f;
   u64 packet_number = 0;
+  b32 resuming_from_sleep = 0;
   for(;;){
     f32 dt_for_tick = target_seconds_per_tick;
     time_since_last_packet_sent += dt_for_tick;
+
+    // Increase the time since last heard clients first, then process packets.
+    for(u32 i = 1; i < host->client_count; ++i){
+      if(!host->clients[i].is_connected){
+        continue;
+      }
+
+      host->clients[i].time_since_last_message += dt_for_tick;
+      // If we haven't heard from them in 10 seconds, disconnect.
+      if(host->clients[i].time_since_last_message > 10.0f){
+        syslog(LOG_NOTICE, "Connection timed out.\n");
+        --host->connected_client_count;
+        host->clients[i] = {};
+        host->clients[i].host = host;
+        squares[i] = {};
+      }
+    }
     
-    f32 wait_time = (0.167f - dt_for_tick) * 1000; // 1000 gets us to ms
-    if(wait_time < 0.0f) wait_time = 0.0f;
-    int is_incoming_packet = socket_wait(host->socket, 10);
-    if(is_incoming_packet){
+    int32 wait_time = 10;
+    // If no one is connected, we will wait infinitely until we get a new connection.
+    // As there is nothing to do anyway.
+    if(!host->connected_client_count) {
+      wait_time = -1;
+      resuming_from_sleep = 1;
+    }
+    int is_incoming_packet = socket_wait(host->socket, wait_time);
+
+    // TODO(Trystan): The way this is set up will only get us one packet per tick.
+    // We need to keep handling packets until there are none left.
+    while(is_incoming_packet){
       handle_incoming_packets(host);
+      is_incoming_packet = socket_wait(host->socket, 0);
     }
 
     if(time_since_last_packet_sent > 0.167f){
@@ -410,6 +441,14 @@ int main(int argc, char **argv){
     f32 measured_seconds_per_tick = linux_get_seconds_elapsed(last_counter, end_counter);
 
     target_seconds_per_tick = measured_seconds_per_tick;
+
+    if(resuming_from_sleep){
+      // When we wake after sleep, we will want to reset the delta time.
+      // Otherwise it seems like the new connection hasn't sent a message since before sleep.
+      // We wouldn't want to receive a normal packet using the sleep delta time either.
+      // Bad all around. Best to get rid of it.
+      target_seconds_per_tick = (f32)expected_frames_per_update / (f32)tick_rate;
+    }
 
     last_counter = end_counter;
   }

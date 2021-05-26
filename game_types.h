@@ -177,11 +177,20 @@ union v4
   f32 E[4];
 };
 
+struct m4x4
+{
+    // NOTE(Trystan): From casey: These are stored ROW MAJOR - E[ROW][COLUMN]!!!
+    f32 E[4][4];
+};
+
 #if !defined(internal)
 #define internal static
 #endif
 #define local_persist static
 #define global static
+
+#define Pi32 3.14159265359f
+#define Tau32 6.28318530717958647692f
 
 #define assert(expression) if(!(expression)) {*(volatile int *)0 = 0;}
 

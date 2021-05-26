@@ -1,6 +1,6 @@
 #include "game_platform.h"
-#include "game_math.h"
 #include "game_intrinsics.h"
+#include "game_math.h"
 #include "game_network.h"
 
 // This is required becuase we are doing socket programming while also including windows.h
@@ -14,16 +14,80 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
-
-
 // D3D12 related includes
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <D3DCompiler.h>
 #define DEBUG 1
-#define FRAME_COUNT 2
 
 #include "win32_main.h"
+
+
+
+
+
+
+
+//
+//
+// ==================================================
+//
+//
+//
+//
+//
+//
+//  Okay I'm taking a break from this for a bit.
+//  I think I've narrowed down the problem
+//  The constant buffers aren't making it into the shader
+//  So something is going wrong with the upload I think
+//  Or the memcpy.
+//
+//
+//  But we finally got the vertex and index data going in
+//  Yet we still do not have anything on the screen
+//
+//  One thing I wanted to test was to have a simple shader program
+//  That requires no inputs. See if that puts anything on the screen
+//  Like the program we had when it was just one square.
+//
+//  I am leaving now to work on the silly mapping tool.
+//  I hope to be back soon.
+//  03/10/2021
+//
+//
+//
+//
+//
+//
+//
+//
+//
+// ===================================================
+//
+//
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#define MAX_SQUARES 8
+#define FRAME_RESOURCE_COUNT 3
+#define BACK_BUFFER_COUNT 2
 
 global int global_running;
 global s64 global_performance_count_frequency;
@@ -31,39 +95,23 @@ global s64 global_performance_count_frequency;
 // D3D12 related variables
 global ID3D12Device *d3d12_device;
 global ID3D12CommandQueue *d3d12_command_queue;
-global IDXGISwapChain3 *d3d12_swap_chain;
+global IDXGISwapChain *d3d12_swap_chain;
 global ID3D12DescriptorHeap *d3d12_rtv_heap;
+global ID3D12DescriptorHeap *d3d12_dsv_heap;
 global ID3D12DescriptorHeap *d3d12_cbv_heap;
-global ID3D12Resource *d3d12_render_targets[FRAME_COUNT];
+global ID3D12Resource *d3d12_swap_chain_buffer[BACK_BUFFER_COUNT];
+global u32 d3d12_current_back_buffer = 0;
+global ID3D12Resource *d3d12_depth_stencil_buffer;
 global ID3D12CommandAllocator *d3d12_command_allocator;
 global ID3D12RootSignature *d3d12_signature;
 global ID3D12PipelineState *d3d12_pipeline_state;
 global ID3D12GraphicsCommandList *d3d12_command_list;
 
-global ID3D12Resource *d3d12_vertex_buffer;
-global ID3D12Resource *d3d12_constant_buffer;
-global D3D12_VERTEX_BUFFER_VIEW d3d12_vertex_buffer_view;
-
-
-
-struct d3d12_vertex {
-  v3 position;
-  v4 color;
-};
-
-struct temp_constant_buffer{
-  v4 offset;
-  float padding[60]; // NOTE(Trystan): constant buffer must be 256-byte aligned.
-};
-
-global UINT8 *d3d12_cbv_data_begin = NULL;
-global temp_constant_buffer d3d12_constant_buffer_data = {};
-
-global UINT d3d12_frame_index;
 global UINT d3d12_rtv_descriptor_size;
-global HANDLE d3d12_fence_event;
 global ID3D12Fence *d3d12_fence;
 global UINT64 d3d12_fence_value;
+
+global u32 d3d12_pass_cbv_offset = 0;
 
 global D3D12_VIEWPORT d3d12_viewport;
 global D3D12_RECT d3d12_scissor_rect;
@@ -73,58 +121,483 @@ global char *d3d12_shader_code = R"FOO(
 // We either want to embed this in our code files
 // Or I think end game would be pre-compiling the shader.
 
-cbuffer temp_constant_buffer : register(b0)
+cbuffer cbPerObject : register(b0)
 {
-   float4 offset;
-   float4 padding[15];
+    float4x4 gWorld;
+};
+
+cbuffer cbPass : register(b1)
+{
+    float4x4 gView;
+    float4x4 gInvView;
+    float4x4 gProj;
+    float4x4 gInvProj;
+    float4x4 gViewProj;
+    float4x4 gInvViewProj;
+    float3 gEyePosW;
+    float cbPerObjectPad1;
+    float2 gRenderTargetSize;
+    float2 gInvRenderTargetSize;
+    float gNearZ;
+    float gFarZ;
+    float gTotalTime;
+    float gDeltaTime;
+};
+
+struct VSInput
+{
+	float3 position  : POSITION;
+    float4 color : COLOR;
 };
 
 struct PSInput
 {
-    float4 position : SV_POSITION;
+	float4 position  : SV_POSITION;
     float4 color : COLOR;
 };
 
-PSInput VSMain(float4 position : POSITION, float4 color : COLOR)
+PSInput VSMain(VSInput input)
 {
-    PSInput result;
-
-    result.position = position + offset;
-    result.color = color;
-
+	PSInput result;
+	
+	// Transform to homogeneous clip space.
+    //float4 posW = mul(float4(vin.PosL, 1.0f), gWorld);
+    //vout.PosH = mul(posW, gViewProj);
+	
+	// Just pass vertex color into the pixel shader.
+    result.color = input.color;
+    result.position = float4(input.position, 1.0f);
+    
     return result;
 }
 
-float4 PSMain(PSInput input) : SV_TARGET
+float4 PSMain(PSInput input) : SV_Target
 {
     return input.color;
 }
 )FOO";
 
-internal void d3d12_wait_for_previous_frame(){
+// object and pass constants get used in the shader program.
+struct d3d12_object_constants{
+  m4x4 world;
+};
+
+struct d3d12_pass_constants{
+  m4x4 view;
+  m4x4 inv_view;
+  m4x4 projection;
+  m4x4 inv_projection;
+  m4x4 view_projection;
+  m4x4 inv_view_projection;
+  v3 eye_pos_w;
+  f32 cb_per_object_pad1;
+  v2 render_target_size;
+  v2 inv_render_target_size;
+  f32 near_z;
+  f32 far_z;
+  f32 total_time;
+  f32 delta_time;
+};
+
+struct d3d12_vertex {
+  v3 position;
+  v4 color;
+};
+
+struct d3d12_mesh_geometry{
+  // System memory copies. Blobs are used as format can be generic.
+  // Cast when using the code.
+  ID3DBlob *vertex_buffer_CPU;
+  ID3DBlob *index_buffer_CPU;
+
+  ID3D12Resource *vertex_buffer_GPU;
+  ID3D12Resource *index_buffer_GPU;
+
+  ID3D12Resource *vertex_buffer_uploader;
+  ID3D12Resource *index_buffer_uploader;
+
+  u32 vertex_byte_stride;
+  u32 vertex_buffer_byte_size;
+  DXGI_FORMAT index_format;  // 16 bit unsigned. We may need to change the u32 *indices
+  u32 index_buffer_byte_size;
+  u32 index_count;
+
+  
+  d3d12_vertex *vertices;
+  u16 *indices;
+};
+
+// TODO(Trystan): When we organize the code, put this somewhere better.
+global d3d12_mesh_geometry mesh_geometry;
+
+struct d3d12_render_item{
+  m4x4 world;
+  s32 constant_buffer_index;
+};
+
+struct d3d12_upload_buffer {
+  ID3D12Resource *upload_buffer;
+  u8 *mapped_data;
+
+  u32 element_byte_size;
+};
+
+struct d3d12_frame_resource {
+  ID3D12CommandAllocator *command_list_allocator;
+
+  // We cannot update a cbuffer until the GPU is done processing the commands
+  // that reference it. So each frame needs their own cbuffers.
+  d3d12_upload_buffer pass_constant_buffer;
+  d3d12_upload_buffer object_constant_buffer;
+
+  u64 fence;
+};
+
+global d3d12_render_item d3d12_squares[MAX_SQUARES] = {};
+global d3d12_pass_constants d3d12_pass_constant;
+global m4x4 view_matrix;
+global m4x4 projection_matrix;
+global v3 eye_pos;
+global d3d12_frame_resource d3d12_frame_resources[FRAME_RESOURCE_COUNT];
+
+global u32 d3d12_current_frame_resource_index = 0;
+global d3d12_frame_resource *d3d12_current_frame_resource = NULL;
+
+internal D3D12_RESOURCE_DESC d3d12_create_default_description_buffer(u64 byte_size){
+  D3D12_RESOURCE_DESC description;
+  description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  description.Alignment = 0;
+  description.Width = byte_size;
+  description.Height = 1;
+  description.DepthOrArraySize = 1;
+  description.MipLevels = 1;
+  description.Format = DXGI_FORMAT_UNKNOWN;
+  description.SampleDesc.Count = 1;
+  description.SampleDesc.Quality = 0;
+  description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  description.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+  return description;
+}
+
+// We could just directly store the vertices and indices directly, since we're only doing squares anyway.
+// However this allows us to be a little more flexible.
+internal void generate_box_geometry(d3d12_mesh_geometry *geometry, f32 width, f32 height, f32 depth){
+  geometry->vertex_buffer_byte_size = 24 * sizeof(d3d12_vertex);
+  geometry->vertices = (d3d12_vertex *)VirtualAlloc(0, geometry->vertex_buffer_byte_size,
+                                                    MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
+
+  geometry->index_buffer_byte_size = 36 * sizeof(u16);
+  geometry->index_count = 36;
+  geometry->indices = (u16 *)VirtualAlloc(0, geometry->index_buffer_byte_size,
+                                          MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
+
+  f32 aspect_ratio = 1920.0f / 1080.0f;
+  
+  f32 w = 0.5f * width;
+  f32 h = (0.5f * height) * aspect_ratio;
+  f32 d = 0.5f * depth;
+  
+  d3d12_vertex *v = geometry->vertices;
+
+  // Front face
+  v[0]  = { V3(-w, -h, -d), V4(0.9f, 0.2f, 0.9f, 1.0f) };
+  v[1]  = { V3(-w, +h, -d), V4(0.9f, 0.2f, 0.9f, 1.0f) };
+  v[2]  = { V3(+w, +h, -d), V4(0.9f, 0.2f, 0.9f, 1.0f) };
+  v[3]  = { V3(+w, -h, -d), V4(0.9f, 0.2f, 0.9f, 1.0f) };
+
+  // Back face
+  v[4]  = { V3(-w, -h, +d), V4(0.9f, 0.2f, 0.9f, 1.0f) };
+  v[5]  = { V3(+w, -h, +d), V4(0.9f, 0.2f, 0.9f, 1.0f) };
+  v[6]  = { V3(+w, +h, +d), V4(0.9f, 0.2f, 0.9f, 1.0f) };
+  v[7]  = { V3(-w, +h, +d), V4(0.9f, 0.2f, 0.9f, 1.0f) };
+
+  // Top face
+  v[8]  = { V3(-w, +h, -d), V4(0.9f, 0.2f, 0.9f, 1.0f) };
+  v[9]  = { V3(-w, +h, +d), V4(0.9f, 0.2f, 0.9f, 1.0f) };
+  v[10] = { V3(+w, +h, +d), V4(0.9f, 0.2f, 0.9f, 1.0f) };
+  v[11] = { V3(+w, +h, -d), V4(0.9f, 0.2f, 0.9f, 1.0f) };
+
+  // Bottom face
+  v[12] = { V3(-w, -h, -d), V4(0.9f, 0.2f, 0.9f, 1.0f) };
+  v[13] = { V3(+w, -h, -d), V4(0.9f, 0.2f, 0.9f, 1.0f) };
+  v[14] = { V3(+w, -h, +d), V4(0.9f, 0.2f, 0.9f, 1.0f) };
+  v[15] = { V3(-w, -h, +d), V4(0.9f, 0.2f, 0.9f, 1.0f) };
+
+  // Left face
+  v[16] = { V3(-w, -h, +d), V4(0.9f, 0.2f, 0.9f, 1.0f) };
+  v[17] = { V3(-w, +h, +d), V4(0.9f, 0.2f, 0.9f, 1.0f) };
+  v[18] = { V3(-w, +h, -d), V4(0.9f, 0.2f, 0.9f, 1.0f) };
+  v[19] = { V3(-w, -h, -d), V4(0.9f, 0.2f, 0.9f, 1.0f) };
+
+  // Right face
+  v[20] = { V3(+w, -h, -d), V4(0.9f, 0.2f, 0.9f, 1.0f) };
+  v[21] = { V3(+w, +h, -d), V4(0.9f, 0.2f, 0.9f, 1.0f) };
+  v[22] = { V3(+w, +h, +d), V4(0.9f, 0.2f, 0.9f, 1.0f) };
+  v[23] = { V3(+w, -h, +d), V4(0.9f, 0.2f, 0.9f, 1.0f) };
+
+  u16 *i = geometry->indices;
+
+  // Front face
+  i[0] = 0; i[1] = 1; i[2] = 2;
+  i[3] = 0; i[4] = 2; i[5] = 3;
+
+  // Back face
+  i[6] = 4; i[7]  = 5; i[8]  = 6;
+  i[9] = 4; i[10] = 6; i[11] = 7;
+
+  // Top face
+  i[12] = 8; i[13] =  9; i[14] = 10;
+  i[15] = 8; i[16] = 10; i[17] = 11;
+
+  // Bottom face
+  i[18] = 12; i[19] = 13; i[20] = 14;
+  i[21] = 12; i[22] = 14; i[23] = 15;
+
+  // Left face
+  i[24] = 16; i[25] = 17; i[26] = 18;
+  i[27] = 16; i[28] = 18; i[29] = 19;
+
+  // Right face
+  i[30] = 20; i[31] = 21; i[32] = 22;
+  i[33] = 20; i[34] = 22; i[35] = 23;
+
+  geometry->vertex_byte_stride = sizeof(d3d12_vertex);
+  geometry->index_format = DXGI_FORMAT_R16_UINT;
+}
+
+internal ID3D12Resource * d3d12_create_default_buffer(ID3D12Device *device, ID3D12GraphicsCommandList *command_list,
+                                                      void *init_data, u64 byte_size, ID3D12Resource *upload_buffer){
+  ID3D12Resource *default_buffer;
+  
+  D3D12_HEAP_PROPERTIES default_heap_properties = {};
+  default_heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+  default_heap_properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+  default_heap_properties.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+  default_heap_properties.CreationNodeMask = 1;
+  default_heap_properties.VisibleNodeMask = 1;
+        
+  D3D12_RESOURCE_DESC default_resource_description = {};
+  default_resource_description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  default_resource_description.Alignment = 0;
+  default_resource_description.Width = byte_size;
+  default_resource_description.Height = 1;
+  default_resource_description.DepthOrArraySize = 1;
+  default_resource_description.MipLevels = 1;
+  default_resource_description.Format = DXGI_FORMAT_UNKNOWN;
+  default_resource_description.SampleDesc.Count = 1;
+  default_resource_description.SampleDesc.Quality = 0;
+  default_resource_description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  default_resource_description.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+  assert(d3d12_device->CreateCommittedResource(&default_heap_properties, D3D12_HEAP_FLAG_NONE,
+                                               &default_resource_description, D3D12_RESOURCE_STATE_COMMON,
+                                               0, IID_PPV_ARGS(&default_buffer)) == 0);
+
+  D3D12_HEAP_PROPERTIES upload_heap_properties = {};
+  upload_heap_properties.Type = D3D12_HEAP_TYPE_UPLOAD;
+  upload_heap_properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+  upload_heap_properties.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+  upload_heap_properties.CreationNodeMask = 1;
+  upload_heap_properties.VisibleNodeMask = 1;
+
+  // TODO(Trystan): Can I just re-use the description from up above? I assume I can.
+  D3D12_RESOURCE_DESC upload_resource_description = {};
+  upload_resource_description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  upload_resource_description.Alignment = 0;
+  upload_resource_description.Width = byte_size;
+  upload_resource_description.Height = 1;
+  upload_resource_description.DepthOrArraySize = 1;
+  upload_resource_description.MipLevels = 1;
+  upload_resource_description.Format = DXGI_FORMAT_UNKNOWN;
+  upload_resource_description.SampleDesc.Count = 1;
+  upload_resource_description.SampleDesc.Quality = 0;
+  upload_resource_description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  upload_resource_description.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+  // Leaving this note here from microsoft. May not refer to exactly what I'm doing here.
+  // But still something to keep in mind.
+  // Note: using upload heaps to transfer static data like vert buffers is not 
+  // recommended. Every time the GPU needs it, the upload heap will be marshalled 
+  // over. Please read up on Default Heap usage. An upload heap is used here for 
+  // code simplicity and because there are very few verts to actually transfer.
+  assert(d3d12_device->CreateCommittedResource(&upload_heap_properties, D3D12_HEAP_FLAG_NONE,
+                                               &upload_resource_description, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                               NULL, IID_PPV_ARGS(&upload_buffer)) == 0);
+
+  // Describe the data we want to copy into the default buffer.
+  D3D12_SUBRESOURCE_DATA sub_resource_data = {};
+  sub_resource_data.pData = init_data;
+  sub_resource_data.RowPitch = byte_size;
+  sub_resource_data.SlicePitch = sub_resource_data.RowPitch;
+
+  // Schedule to copy the data to the default buffer resource.  At a high level, the helper function UpdateSubresources
+  // will copy the CPU memory into the intermediate upload heap.  Then, using ID3D12CommandList::CopySubresourceRegion,
+  // the intermediate upload heap data will be copied to mBuffer.
+  D3D12_RESOURCE_BARRIER default_barrier;
+  memset(&default_barrier, 0, sizeof(default_barrier));
+  default_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  default_barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+  default_barrier.Transition.pResource = default_buffer;
+  default_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+  default_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+  default_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+  command_list->ResourceBarrier(1, &default_barrier);
+
+  u64 required_size = 0;
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT layouts[1];
+  u32 row_count[1];
+  u64 row_sizes_in_bytes[1];
+
+  D3D12_RESOURCE_DESC resource_description = default_buffer->GetDesc();
+  ID3D12Device *default_buffer_device;
+  default_buffer->GetDevice(IID_PPV_ARGS(&default_buffer_device));
+  default_buffer_device->GetCopyableFootprints(&resource_description, 0, 1, 0, layouts, row_count, row_sizes_in_bytes, &required_size);
+  default_buffer_device->Release();
+
+  u8 *data;
+  
+  upload_buffer->Map(0, NULL, (void **)&data);
+
+  // TODO(Trystan): I am absolutely certain this is overkill.
+  // I'm just following the way the book shows. But I think we should be able to do it
+  // the same way we did square_vertices.
+  D3D12_MEMCPY_DEST dest_data = { data + layouts[0].Offset, layouts[0].Footprint.RowPitch, layouts[0].Footprint.RowPitch * row_count[0] };
+  for(u32 z = 0; z < layouts[0].Footprint.Depth; ++z){
+    u8 *dest_slice = (u8 *)(dest_data.pData) + (dest_data.SlicePitch * z);
+    u8 *src_slice = (u8 *)(sub_resource_data.pData) + (sub_resource_data.SlicePitch * z);
+    for (u32 y = 0; y < row_count[0]; ++y){
+      memcpy(dest_slice + dest_data.RowPitch * y, src_slice + sub_resource_data.RowPitch * y, (SIZE_T)row_sizes_in_bytes[0]);
+    }
+  }
+
+  //memcpy(dest_data.pData, init_data, byte_size);
+
+  upload_buffer->Unmap(0, NULL);
+
+  // NOTE(Trystan): This code is in d3dx12.h and doesn't even do anything???
+  //CD3DX12_BOX SrcBox( UINT( layouts[0].Offset ), UINT( layouts[0].Offset + layouts[0].Footprint.Width ) );
+  //D3D12_BOX src_box = {};
+  //src_box.left = layouts[0].Offset;
+  //src_box.top = 0;
+  //src_box.front = 0;
+  //src_box.right = layouts[0].Offset + layouts[0].Footprint.Width;
+  //src_box.bottom = 1;
+  //src_box.back = 1;
+  command_list->CopyBufferRegion(default_buffer, 0, upload_buffer, layouts[0].Offset, layouts[0].Footprint.Width);
+
+  default_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+  default_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_GENERIC_READ;
+  command_list->ResourceBarrier(1, &default_barrier);
+
+  return default_buffer;
+}
+
+internal void d3d12_update_object_constant_buffer(){
+  d3d12_upload_buffer *object_buffer = &d3d12_current_frame_resource->object_constant_buffer;
+  for(u32 i = 0; i < MAX_SQUARES; ++i){
+    d3d12_object_constants object_constant;
+    object_constant.world = Transpose(d3d12_squares[i].world);
+
+    u32 object_buffer_size = (sizeof(d3d12_object_constants) + 255) & ~255;
+    memcpy(&object_buffer->mapped_data[object_buffer_size * d3d12_squares[i].constant_buffer_index],
+           &object_constant, sizeof(d3d12_object_constants));
+  }
+}
+
+internal void d3d12_update_pass_constant_buffer(){
+  m4x4 view_projection = view_matrix * projection_matrix;
+
+
+  d3d12_pass_constant.view = Transpose(view_matrix);
+  d3d12_pass_constant.projection = Transpose(projection_matrix);
+  d3d12_pass_constant.view_projection = Transpose(view_projection);
+  d3d12_pass_constant.eye_pos_w = eye_pos;
+  d3d12_pass_constant.render_target_size = V2(1920.0f, 1080.0f);
+  d3d12_pass_constant.inv_render_target_size = V2(1.0f / 1920.0f, 1.0f / 1080.0f);
+  d3d12_pass_constant.near_z = 1.0f;
+  d3d12_pass_constant.far_z = 1000.0f;
+  d3d12_pass_constant.total_time = 0.0f; // Time seems to be unused.
+  d3d12_pass_constant.delta_time = 0.0f;
+  
+  memcpy(d3d12_current_frame_resource->pass_constant_buffer.mapped_data, &d3d12_pass_constant, sizeof(d3d12_pass_constants));
+}
+
+internal void d3d12_update(){
+  f32 theta = 1.5f * Pi32;
+  f32 phi = 0.2f * Pi32;
+  f32 radius = 15.0f;
+
+  // Convert Spherical to Cartesian coordinates.
+  eye_pos.x = radius * -1 * 0; //radius * Sin(theta) * Cos(theta);
+  eye_pos.z = radius * 0.809017f * -1; //radius * Cos(phi) * Sin(theta);
+  eye_pos.y = radius * 0.809017f;
+
+    
+
+  // Build the view matrix.
+  v3 pos = V3(eye_pos.x, eye_pos.y, eye_pos.z);
+  v3 target = V3(0.0f, 0.0f, 0.0f);
+  v3 up = V3(0.0f, 1.0f, 0.0f);
+
+  v3 z_axis = Normalize(target) - Normalize(pos);
+  v3 x_axis = Normalize(Cross(up, z_axis));
+  v3 y_axis = Cross(z_axis, x_axis);
+
+  m4x4 orientation = {
+    {{x_axis.x, y_axis.x, z_axis.x, 0.0f},
+     {x_axis.y, y_axis.y, z_axis.y, 0.0f},
+     {x_axis.z, y_axis.z, z_axis.z, 0.0f},
+     {0.0f,     0.0f,     0.0f,     1.0f}},
+  };
+
+  m4x4 translation = {
+    {{ 1.0f,   0.0f,   0.0f,  0.0f},
+     { 0.0f,   1.0f,   0.0f,  0.0f},
+     { 0.0f,   0.0f,   1.0f,  0.0f},
+     {-pos.x, -pos.y, -pos.z, 1.0f}},
+  };
+
+  m4x4 view = orientation * translation;
+
+  view_matrix = view;
+
+  
   // WAITING FOR THE FRAME TO COMPLETE BEFORE CONTINUING IS NOT BEST PRACTICE.
   // This is code implemented as such for simplicity. The D3D12HelloFrameBuffering
   // sample illustrates how to use fences for efficient resource usage and to
   // maximize GPU utilization.
-    
-  UINT64 fence = d3d12_fence_value;
-  assert(d3d12_command_queue->Signal(d3d12_fence, fence) == 0);
-  d3d12_fence_value += 1;
-    
+  
+  d3d12_current_frame_resource_index = (d3d12_current_frame_resource_index + 1) % FRAME_RESOURCE_COUNT;
+  d3d12_current_frame_resource = &d3d12_frame_resources[d3d12_current_frame_resource_index];
+
   // Wait until previous frame is finished.
-  if(d3d12_fence->GetCompletedValue() < fence){
-    assert(d3d12_fence->SetEventOnCompletion(fence, d3d12_fence_event) == 0);
-    WaitForSingleObject(d3d12_fence_event, INFINITE);
+  if(d3d12_current_frame_resource->fence != 0 && d3d12_fence->GetCompletedValue() < d3d12_current_frame_resource->fence){
+    HANDLE event_handle = CreateEventEx(0, 0, 0, EVENT_ALL_ACCESS);
+    assert(d3d12_fence->SetEventOnCompletion(d3d12_current_frame_resource->fence, event_handle) == 0);
+    WaitForSingleObject(event_handle, INFINITE);
+    CloseHandle(event_handle);
   }
-    
-  d3d12_frame_index = d3d12_swap_chain->GetCurrentBackBufferIndex();
+
+  d3d12_update_object_constant_buffer();
+  d3d12_update_pass_constant_buffer();
 }
 
 internal void d3d12_init(HWND *window) {
-  // Some top level variable setup.
-  // 1280 720 width and height
-  d3d12_viewport = {0.0f, 0.0f, 1280.0f, 720.0f};
-  d3d12_scissor_rect = {0, 0, 1280, 720};
+  d3d12_viewport.TopLeftX = 0;
+  d3d12_viewport.TopLeftY = 0;
+  d3d12_viewport.Width    = 1920.0f;
+  d3d12_viewport.Height   = 1080.0f;
+  d3d12_viewport.MinDepth = 0.0f;
+  d3d12_viewport.MaxDepth = 1.0f;
+
+  d3d12_pass_constant = {};
+  view_matrix = Identity();
+  projection_matrix = Identity();
+  eye_pos = V3(0.0f, 0.0f, 0.0f);
+  
+  d3d12_scissor_rect = {0, 0, 1920, 1080};
     
   UINT dxgi_factory_flags = 0;
     
@@ -196,58 +669,115 @@ internal void d3d12_init(HWND *window) {
     
   assert(d3d12_device->CreateCommandQueue(&queue_description, IID_PPV_ARGS(&d3d12_command_queue)) == 0);
     
-  DXGI_SWAP_CHAIN_DESC1 swap_chain_description = {};
-  swap_chain_description.BufferCount = FRAME_COUNT;
+  DXGI_SWAP_CHAIN_DESC swap_chain_description = {};
+  swap_chain_description.BufferCount = BACK_BUFFER_COUNT;
   // Example shows this height and width
-  swap_chain_description.Width = 1280;
-  swap_chain_description.Height = 720;
-  swap_chain_description.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  swap_chain_description.BufferDesc.Width = 1920;
+  swap_chain_description.BufferDesc.Height = 1080;
+  swap_chain_description.BufferDesc.RefreshRate.Numerator = 144;
+  swap_chain_description.BufferDesc.RefreshRate.Denominator = 1;
+  swap_chain_description.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  swap_chain_description.BufferDesc.ScanlineOrdering = DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED;
+  swap_chain_description.BufferDesc.Scaling = DXGI_MODE_SCALING_UNSPECIFIED;
   swap_chain_description.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-  swap_chain_description.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD; // Check if we want this.
-  swap_chain_description.SampleDesc.Count = 1; // Wut?
-    
-  IDXGISwapChain1 *swap_chain1;
-  assert(dxgi_factory->CreateSwapChainForHwnd(d3d12_command_queue, *window, &swap_chain_description, NULL, NULL, &swap_chain1) == 0);
-    
-  // TODO(Trystan): That example doesn't support fullscreen, circle back around to that.
-  assert(dxgi_factory->MakeWindowAssociation(*window, DXGI_MWA_NO_ALT_ENTER) == 0);
-    
-  d3d12_swap_chain = (IDXGISwapChain3 *)swap_chain1;
-    
-  d3d12_frame_index = d3d12_swap_chain->GetCurrentBackBufferIndex();
-    
+  swap_chain_description.BufferCount = BACK_BUFFER_COUNT;
+  swap_chain_description.SampleDesc.Count = 1;
+  swap_chain_description.SampleDesc.Quality = 0;
+  swap_chain_description.OutputWindow = *window;
+  swap_chain_description.Windowed = true;
+  swap_chain_description.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+  swap_chain_description.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+  
+  assert(dxgi_factory->CreateSwapChain(d3d12_command_queue, &swap_chain_description, &d3d12_swap_chain) == 0);
+  
   {
     D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_description = {};
-    rtv_heap_description.NumDescriptors = FRAME_COUNT;
+    rtv_heap_description.NumDescriptors = BACK_BUFFER_COUNT;
     rtv_heap_description.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     rtv_heap_description.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
         
     assert(d3d12_device->CreateDescriptorHeap(&rtv_heap_description, IID_PPV_ARGS(&d3d12_rtv_heap)) == 0);
+    
         
     d3d12_rtv_descriptor_size = d3d12_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
-    // Describe and create a constant buffer view (CBV) descriptor heap.
-    // Flags indicate that this descriptor heap can be bound to the pipeline
-    // and that descriptors contained in it can be referenced by a root table.
-    D3D12_DESCRIPTOR_HEAP_DESC cbv_heap_description = {};
-    cbv_heap_description.NumDescriptors = 1;
-    cbv_heap_description.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    cbv_heap_description.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    assert(d3d12_device->CreateDescriptorHeap(&cbv_heap_description, IID_PPV_ARGS(&d3d12_cbv_heap)) == 0);
-  }
+    // Depth stencil view
+    D3D12_DESCRIPTOR_HEAP_DESC dsv_heap_description = {};
+    dsv_heap_description.NumDescriptors = 1;
+    dsv_heap_description.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+    dsv_heap_description.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
     
+    assert(d3d12_device->CreateDescriptorHeap(&dsv_heap_description, IID_PPV_ARGS(&d3d12_dsv_heap)) == 0);
+  }
+
   {
     D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = {};
     rtv_handle.ptr = d3d12_rtv_heap->GetCPUDescriptorHandleForHeapStart().ptr;
         
-    for(UINT n = 0; n < FRAME_COUNT; ++n){
-      assert(d3d12_swap_chain->GetBuffer(n, IID_PPV_ARGS(&d3d12_render_targets[n])) == 0);
-      d3d12_device->CreateRenderTargetView(d3d12_render_targets[n], NULL, rtv_handle);
+    for(UINT n = 0; n < BACK_BUFFER_COUNT; ++n){
+      assert(d3d12_swap_chain->GetBuffer(n, IID_PPV_ARGS(&d3d12_swap_chain_buffer[n])) == 0);
+      d3d12_device->CreateRenderTargetView(d3d12_swap_chain_buffer[n], NULL, rtv_handle);
       rtv_handle.ptr += d3d12_rtv_descriptor_size;
     }
+
+    D3D12_RESOURCE_DESC stencil_description;
+    stencil_description.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    stencil_description.Alignment = 0;
+    stencil_description.Width = 1920;
+    stencil_description.Height = 1080;
+    stencil_description.DepthOrArraySize = 1;
+    stencil_description.MipLevels = 1;
+    stencil_description.Format = DXGI_FORMAT_R24G8_TYPELESS;
+
+    stencil_description.SampleDesc.Count = 1;
+    stencil_description.SampleDesc.Quality = 0;
+    stencil_description.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    stencil_description.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+
+    D3D12_CLEAR_VALUE opt_clear;
+    opt_clear.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    opt_clear.DepthStencil.Depth = 1.0f;
+    opt_clear.DepthStencil.Stencil = 0;
+
+    D3D12_HEAP_PROPERTIES properties;
+    properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    properties.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    properties.CreationNodeMask = 1;
+    properties.VisibleNodeMask = 1;
+    
+    assert(d3d12_device->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &stencil_description,
+                                                 D3D12_RESOURCE_STATE_COMMON, &opt_clear,
+                                                 IID_PPV_ARGS(&d3d12_depth_stencil_buffer)) == 0);
+
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsv_desc;
+	dsv_desc.Flags = D3D12_DSV_FLAG_NONE;
+	dsv_desc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+	dsv_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+	dsv_desc.Texture2D.MipSlice = 0;
+
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle = {};
+    dsv_handle.ptr = d3d12_dsv_heap->GetCPUDescriptorHandleForHeapStart().ptr;
+    
+    d3d12_device->CreateDepthStencilView(d3d12_depth_stencil_buffer, &dsv_desc, dsv_handle);
   }
     
   assert(d3d12_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&d3d12_command_allocator)) == 0);
+}
+
+internal void d3d12_flush_command_queue(){
+  ++d3d12_fence_value;
+
+  assert(d3d12_command_queue->Signal(d3d12_fence, d3d12_fence_value) == 0);
+
+  if(d3d12_fence->GetCompletedValue() < d3d12_fence_value){
+    HANDLE event_handle = CreateEventEx(0, 0, 0, EVENT_ALL_ACCESS);
+
+    assert(d3d12_fence->SetEventOnCompletion(d3d12_fence_value, event_handle) == 0);
+
+    WaitForSingleObject(event_handle, INFINITE);
+    CloseHandle(event_handle);
+  }
 }
 
 internal void d3d12_load_assets() {
@@ -261,31 +791,39 @@ internal void d3d12_load_assets() {
       feature_data.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_0;
     }
 
-    D3D12_DESCRIPTOR_RANGE1 ranges[1] = {};
-    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
-    ranges[0].NumDescriptors = 1;
-    ranges[0].BaseShaderRegister = 0;
-    ranges[0].RegisterSpace = 0;
-    ranges[0].Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC;
-    ranges[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    D3D12_DESCRIPTOR_RANGE1 range0 = {};
+    range0.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
+    range0.NumDescriptors = 1;
+    range0.BaseShaderRegister = 0;
+    range0.RegisterSpace = 0;
+    range0.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_DESCRIPTOR_RANGE1 range1 = {};
+    range1.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
+    range1.NumDescriptors = 1;
+    range1.BaseShaderRegister = 1;
+    range1.RegisterSpace = 0;
+    range1.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
     
-    D3D12_ROOT_PARAMETER1 root_parameters[1] = {};
+    D3D12_ROOT_PARAMETER1 root_parameters[2] = {};
     root_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    root_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    root_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
-    D3D12_ROOT_DESCRIPTOR_TABLE1 root_descriptor_table = {};
-    root_descriptor_table.NumDescriptorRanges = 1;
-    root_descriptor_table.pDescriptorRanges = &ranges[0];
+    D3D12_ROOT_DESCRIPTOR_TABLE1 root_descriptor_table0 = {};
+    root_descriptor_table0.NumDescriptorRanges = 1;
+    root_descriptor_table0.pDescriptorRanges = &range0;
 
-    root_parameters[0].DescriptorTable = root_descriptor_table;
+    root_parameters[0].DescriptorTable = root_descriptor_table0;
 
-    // Allow input layout and deny uneccessary access to certain pipeline stages.
-    D3D12_ROOT_SIGNATURE_FLAGS signature_flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
-      D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
-      D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
-      D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS |
-      D3D12_ROOT_SIGNATURE_FLAG_DENY_PIXEL_SHADER_ROOT_ACCESS;
+    root_parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    root_parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_ROOT_DESCRIPTOR_TABLE1 root_descriptor_table1 = {};
+    root_descriptor_table1.NumDescriptorRanges = 1;
+    root_descriptor_table1.pDescriptorRanges = &range1;
+
+    root_parameters[1].DescriptorTable = root_descriptor_table1;
 
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC signature_description = {};
     signature_description.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
@@ -293,13 +831,13 @@ internal void d3d12_load_assets() {
     signature_description.Desc_1_1.pParameters = root_parameters;
     signature_description.Desc_1_1.NumStaticSamplers = 0;
     signature_description.Desc_1_1.pStaticSamplers = NULL;
-    signature_description.Desc_1_1.Flags = signature_flags;
+    signature_description.Desc_1_1.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     
     ID3DBlob *signature;
     ID3DBlob *error;
 
-    // This call assumes that we actually got version 1_1.
     assert(D3D12SerializeVersionedRootSignature(&signature_description, &signature, &error) == 0);
+
     assert(d3d12_device->CreateRootSignature(0, signature->GetBufferPointer(),
                                              signature->GetBufferSize(), IID_PPV_ARGS(&d3d12_signature)) == 0);
   }
@@ -315,11 +853,10 @@ internal void d3d12_load_assets() {
     UINT compile_flags = 0;
 #endif
         
-        
     assert(D3DCompile(d3d12_shader_code, string_length(d3d12_shader_code),
-                      NULL, NULL, NULL, "VSMain", "vs_5_0", compile_flags, 0, &vertex_shader, NULL) == 0);
+                      NULL, NULL, NULL, "VSMain", "vs_5_1", compile_flags, 0, &vertex_shader, NULL) == 0);
     assert(D3DCompile(d3d12_shader_code, string_length(d3d12_shader_code),
-                      NULL, NULL, NULL, "PSMain", "ps_5_0", compile_flags, 0, &pixel_shader, NULL) == 0);
+                      NULL, NULL, NULL, "PSMain", "ps_5_1", compile_flags, 0, &pixel_shader, NULL) == 0);
         
     // Define the vertex input layout.
     D3D12_INPUT_ELEMENT_DESC input_element_descriptions[2] = {};
@@ -363,6 +900,19 @@ internal void d3d12_load_assets() {
     for (UINT i = 0; i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
       blend_description.RenderTarget[i] = default_render_target_blend_description;
     }
+
+    // This is the default DEPTH_STENCIL_DESC
+    D3D12_DEPTH_STENCIL_DESC depth_description = {};
+    depth_description.DepthEnable = TRUE;
+    depth_description.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    depth_description.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    depth_description.StencilEnable = FALSE;
+    depth_description.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
+    depth_description.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
+    const D3D12_DEPTH_STENCILOP_DESC default_stencil_op =
+      { D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_ALWAYS };
+    depth_description.FrontFace = default_stencil_op;
+    depth_description.BackFace = default_stencil_op;
         
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_description = {};
     pso_description.InputLayout = { input_element_descriptions, array_count(input_element_descriptions) };
@@ -371,12 +921,12 @@ internal void d3d12_load_assets() {
     pso_description.PS = ps_bytecode;
     pso_description.RasterizerState = rasterizer_description;
     pso_description.BlendState = blend_description;
-    pso_description.DepthStencilState.DepthEnable = FALSE;
-    pso_description.DepthStencilState.StencilEnable = FALSE;
+    pso_description.DepthStencilState = depth_description;
     pso_description.SampleMask = UINT_MAX;
     pso_description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pso_description.NumRenderTargets = 1;
     pso_description.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pso_description.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
     pso_description.SampleDesc.Count = 1;
         
     assert(d3d12_device->CreateGraphicsPipelineState(&pso_description, IID_PPV_ARGS(&d3d12_pipeline_state)) == 0);
@@ -385,104 +935,141 @@ internal void d3d12_load_assets() {
   assert(d3d12_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, d3d12_command_allocator,
                                          d3d12_pipeline_state, IID_PPV_ARGS(&d3d12_command_list)) == 0);
     
-  // Command lists are created in the recording state, but there is nothing to record yet.
-  assert(d3d12_command_list->Close() == 0);
-    
-  // Create vertex buffer
+  // Create vertex and index buffer
   {
-    float aspect_ratio = 1920.0f / 1080.0f;
-    d3d12_vertex square_vertices[] = {{ V3(0.25f,  0.25f * aspect_ratio, 0.0f),  V4(0.9f, 0.2f, 0.9f, 1.0f) },
-                                      { V3(0.25f, -0.25f * aspect_ratio, 0.0f),  V4(0.9f, 0.2f, 0.9f, 1.0f) },
-                                      { V3(-0.25f,  0.25f * aspect_ratio, 0.0f), V4(0.9f, 0.2f, 0.9f, 1.0f) },
-                                      { V3(0.25f, -0.25f * aspect_ratio, 0.0f),  V4(0.9f, 0.2f, 0.9f, 1.0f) },
-                                      { V3(-0.25f, -0.25f * aspect_ratio, 0.0f), V4(0.9f, 0.2f, 0.9f, 1.0f) },
-                                      { V3(-0.25f,  0.25f * aspect_ratio, 0.0f), V4(0.9f, 0.2f, 0.9f, 1.0f) }};
-        
-    UINT vertex_buffer_size = sizeof(square_vertices);
-        
-    D3D12_HEAP_PROPERTIES heap_properties = {};
-    heap_properties.Type = D3D12_HEAP_TYPE_UPLOAD;
-    heap_properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
-    heap_properties.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
-    heap_properties.CreationNodeMask = 1;
-    heap_properties.VisibleNodeMask = 1;
-        
-    D3D12_RESOURCE_DESC resource_description = {};
-    resource_description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    resource_description.Alignment = 0;
-    resource_description.Width = vertex_buffer_size;
-    resource_description.Height = 1;
-    resource_description.DepthOrArraySize = 1;
-    resource_description.MipLevels = 1;
-    resource_description.Format = DXGI_FORMAT_UNKNOWN;
-    resource_description.SampleDesc.Count = 1;
-    resource_description.SampleDesc.Quality = 0;
-    resource_description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    resource_description.Flags = D3D12_RESOURCE_FLAG_NONE;
-        
-    // Note: using upload heaps to transfer static data like vert buffers is not 
-    // recommended. Every time the GPU needs it, the upload heap will be marshalled 
-    // over. Please read up on Default Heap usage. An upload heap is used here for 
-    // code simplicity and because there are very few verts to actually transfer.
-    assert(d3d12_device->CreateCommittedResource(&heap_properties, D3D12_HEAP_FLAG_NONE,
-                                                 &resource_description, D3D12_RESOURCE_STATE_GENERIC_READ,
-                                                 NULL, IID_PPV_ARGS(&d3d12_vertex_buffer)) == 0);
-        
-    // Copy the square data to the vertex buffer.
-    UINT8 *vertex_data_begin;
-    D3D12_RANGE read_range = {}; // Sets range.Begin and range.End to zero.
-    assert(d3d12_vertex_buffer->Map(0, &read_range, (void **)&vertex_data_begin) == 0);
-    memcpy(vertex_data_begin, square_vertices, sizeof(square_vertices));
-    d3d12_vertex_buffer->Unmap(0, NULL);
-        
-    // Initialize the vertex buffer view.
-    d3d12_vertex_buffer_view.BufferLocation = d3d12_vertex_buffer->GetGPUVirtualAddress();
-    d3d12_vertex_buffer_view.StrideInBytes = sizeof(d3d12_vertex);
-    d3d12_vertex_buffer_view.SizeInBytes = vertex_buffer_size;
+    generate_box_geometry(&mesh_geometry, 100.0f, 100.0f, 100.0f);
+    
+    assert(D3DCreateBlob(mesh_geometry.vertex_buffer_byte_size, &mesh_geometry.vertex_buffer_CPU) == 0);
+    memcpy(mesh_geometry.vertex_buffer_CPU->GetBufferPointer(), mesh_geometry.vertices, mesh_geometry.vertex_buffer_byte_size);
+    
+    assert(D3DCreateBlob(mesh_geometry.index_buffer_byte_size, &mesh_geometry.index_buffer_CPU) == 0);
+    memcpy(mesh_geometry.index_buffer_CPU->GetBufferPointer(), mesh_geometry.indices, mesh_geometry.index_buffer_byte_size);
+    
+    mesh_geometry.vertex_buffer_GPU = d3d12_create_default_buffer(d3d12_device,
+                                                                  d3d12_command_list, &mesh_geometry.vertices[0],
+                                                                  mesh_geometry.vertex_buffer_byte_size,
+                                                                  mesh_geometry.vertex_buffer_uploader);
+
+    mesh_geometry.index_buffer_GPU = d3d12_create_default_buffer(d3d12_device,
+                                                                 d3d12_command_list, &mesh_geometry.indices[0],
+                                                                 mesh_geometry.index_buffer_byte_size,
+                                                                 mesh_geometry.index_buffer_uploader);
   }
 
-  // Create the constant buffer.
+  // Setup the 8 render_items. All using the cube mesh, but individual constant buffers.
   {
-    // This one is exactly like the square one.
-    D3D12_HEAP_PROPERTIES heap_properties = {};
-    heap_properties.Type = D3D12_HEAP_TYPE_UPLOAD;
-    heap_properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
-    heap_properties.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
-    heap_properties.CreationNodeMask = 1;
-    heap_properties.VisibleNodeMask = 1;
+    for(s32 i = 0; i < MAX_SQUARES; ++i){
+      d3d12_squares[i].constant_buffer_index = i;
+      d3d12_squares[i].world = Identity();
+      // NOTE(Trystan): The default state of squares is to be off screen.
+      // And drawn on screen whenever we get data on them, then back off screen if we don't.
+      // Obviously not the best way of handling this, but just getting us going quickly.
+      Translate(d3d12_squares[i].world, V3(2.0f * i, 2.0f * i, -5.0f * i));
+    }
+  }
 
-    // temp_constant_buffer is the name of the struct, yes bad. yes temp.
-    UINT constant_buffer_size = sizeof(temp_constant_buffer);
+  // Build the frame resources
+  {
+    for(u32 i = 0; i < FRAME_RESOURCE_COUNT; ++i){
+      assert(d3d12_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                  IID_PPV_ARGS(&d3d12_frame_resources[i].command_list_allocator)) == 0);
+      // Constant buffers must be a multiple of 256 bytes. This rounds us up to the nearest 256.
+      u32 pass_buffer_size = (sizeof(d3d12_pass_constants) + 255) & ~255;
+      u32 object_buffer_size = (sizeof(d3d12_object_constants) + 255) & ~255;
+
+      d3d12_frame_resources[i].fence = 0;
+      d3d12_frame_resources[i].pass_constant_buffer.element_byte_size = pass_buffer_size;
+      d3d12_frame_resources[i].object_constant_buffer.element_byte_size = object_buffer_size;
+
+      D3D12_RESOURCE_DESC pass_buffer_description = d3d12_create_default_description_buffer(pass_buffer_size);
+      D3D12_RESOURCE_DESC object_buffer_description = d3d12_create_default_description_buffer(object_buffer_size * MAX_SQUARES);
+
+      // The same for both constant buffers.
+      D3D12_HEAP_PROPERTIES properties;
+      properties.Type = D3D12_HEAP_TYPE_UPLOAD;
+      properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+      properties.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+      properties.CreationNodeMask = 1;
+      properties.VisibleNodeMask = 1;
+
+      // Just to make the below a little more readable.
+      d3d12_upload_buffer *pass_buffer = &d3d12_frame_resources[i].pass_constant_buffer;
+      d3d12_upload_buffer *object_buffer = &d3d12_frame_resources[i].object_constant_buffer;
+
+      assert(d3d12_device->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &pass_buffer_description,
+                                                   D3D12_RESOURCE_STATE_GENERIC_READ, 0,
+                                                   IID_PPV_ARGS(&pass_buffer->upload_buffer)) == 0);
+
+      assert(d3d12_device->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &object_buffer_description,
+                                                   D3D12_RESOURCE_STATE_GENERIC_READ, 0,
+                                                   IID_PPV_ARGS(&object_buffer->upload_buffer)) == 0);
+
+      assert(pass_buffer->upload_buffer->Map(0, 0, (void **)&pass_buffer->mapped_data) == 0);
+      assert(object_buffer->upload_buffer->Map(0, 0, (void **)&object_buffer->mapped_data) == 0);
+    }
+  }
+
+  // Create constant buffer view descriptor heap
+  {
+    // The one is for the per pass CBV for each frame resource.
+    uint32 descriptor_count = (MAX_SQUARES + 1) * FRAME_RESOURCE_COUNT;
+    d3d12_pass_cbv_offset = MAX_SQUARES * FRAME_RESOURCE_COUNT;
+
+    // Describe and create a constant buffer view (CBV) descriptor heap.
+    // Flags indicate that this descriptor heap can be bound to the pipeline
+    // and that descriptors contained in it can be referenced by a root table.
+    D3D12_DESCRIPTOR_HEAP_DESC cbv_heap_description = {};
+    cbv_heap_description.NumDescriptors = descriptor_count;
+    cbv_heap_description.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    cbv_heap_description.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    cbv_heap_description.NodeMask = 0;
+    assert(d3d12_device->CreateDescriptorHeap(&cbv_heap_description, IID_PPV_ARGS(&d3d12_cbv_heap)) == 0);
+  }
+
+  // Now we actually create the constant buffer view
+  {
+    u32 object_buffer_size = (sizeof(d3d12_object_constants) + 255) & ~255;
+
+    for(u32 frame_index = 0; frame_index < FRAME_RESOURCE_COUNT; ++frame_index){
+      ID3D12Resource *upload_buffer = d3d12_frame_resources[frame_index].object_constant_buffer.upload_buffer;
+      for(u32 i = 0; i < MAX_SQUARES; ++i){
+        D3D12_GPU_VIRTUAL_ADDRESS constant_buffer_address = upload_buffer->GetGPUVirtualAddress();
+
+        // Offset to the ith object constant buffer.
+        constant_buffer_address += i * object_buffer_size;
+
+        // Offset to the object cbv in the descriptor heap.
+        u32 heap_index = frame_index * MAX_SQUARES + i;
+        D3D12_CPU_DESCRIPTOR_HANDLE handle = {};
+        handle.ptr = d3d12_cbv_heap->GetCPUDescriptorHandleForHeapStart().ptr;
+        handle.ptr += heap_index * d3d12_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+        D3D12_CONSTANT_BUFFER_VIEW_DESC cbv_description;
+        cbv_description.BufferLocation = constant_buffer_address;
+        cbv_description.SizeInBytes = object_buffer_size;
+
+        d3d12_device->CreateConstantBufferView(&cbv_description, handle);
+      }
+    }
     
-    // This one only differs in size.
-    D3D12_RESOURCE_DESC resource_description = {};
-    resource_description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    resource_description.Alignment = 0;
-    resource_description.Width = constant_buffer_size;
-    resource_description.Height = 1;
-    resource_description.DepthOrArraySize = 1;
-    resource_description.MipLevels = 1;
-    resource_description.Format = DXGI_FORMAT_UNKNOWN;
-    resource_description.SampleDesc.Count = 1;
-    resource_description.SampleDesc.Quality = 0;
-    resource_description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    resource_description.Flags = D3D12_RESOURCE_FLAG_NONE;
-    
-    assert(d3d12_device->CreateCommittedResource(&heap_properties, D3D12_HEAP_FLAG_NONE,
-                                                 &resource_description, D3D12_RESOURCE_STATE_GENERIC_READ,
-                                                 NULL, IID_PPV_ARGS(&d3d12_constant_buffer)) == 0);
+    u32 pass_buffer_size = (sizeof(d3d12_pass_constants) + 255) & ~255;
 
-    // Describe and create a constant buffer view.
-    D3D12_CONSTANT_BUFFER_VIEW_DESC cbv_description = {};
-    cbv_description.BufferLocation = d3d12_constant_buffer->GetGPUVirtualAddress();
-    cbv_description.SizeInBytes = constant_buffer_size;
-    d3d12_device->CreateConstantBufferView(&cbv_description, d3d12_cbv_heap->GetCPUDescriptorHandleForHeapStart());
+    for(u32 frame_index = 0; frame_index < FRAME_RESOURCE_COUNT; ++frame_index){
+      ID3D12Resource *upload_buffer = d3d12_frame_resources[frame_index].pass_constant_buffer.upload_buffer;
+      D3D12_GPU_VIRTUAL_ADDRESS constant_buffer_address = upload_buffer->GetGPUVirtualAddress();
 
-    // Map and initialize the constant buffer. We don't unmap this until the app closes.
-    // Keeping things mapped for the lifetime of the resource is okay.
-    D3D12_RANGE read_range = {}; // again set Begin and End to zero.
-    assert(d3d12_constant_buffer->Map(0, &read_range, (void **)&d3d12_cbv_data_begin) == 0);
-    memcpy(d3d12_cbv_data_begin, &d3d12_constant_buffer_data, sizeof(d3d12_constant_buffer_data));
+      // Offset to the pass cbv in the descriptor heap.
+      u32 heap_index = d3d12_pass_cbv_offset + frame_index;
+      D3D12_CPU_DESCRIPTOR_HANDLE handle = {};
+      handle.ptr = d3d12_cbv_heap->GetCPUDescriptorHandleForHeapStart().ptr;
+      handle.ptr += heap_index * d3d12_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+      D3D12_CONSTANT_BUFFER_VIEW_DESC cbv_description;
+      cbv_description.BufferLocation = constant_buffer_address;
+      cbv_description.SizeInBytes = pass_buffer_size;
+
+      d3d12_device->CreateConstantBufferView(&cbv_description, handle);
+    }
   }
     
   // Create synchronization objects and wait until assets are uploaded to the GPU.
@@ -490,37 +1077,38 @@ internal void d3d12_load_assets() {
     assert(d3d12_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&d3d12_fence)) == 0);
     d3d12_fence_value = 1;
         
-    // Create an event handle to use for frame synchronization.
-    d3d12_fence_event = CreateEvent(NULL, FALSE, FALSE, NULL);
-    if(!d3d12_fence_event){
-      assert(HRESULT_FROM_WIN32(GetLastError()) == 0);
-    }
-        
-    // Wait for the command list to execute; we are reusing the same command 
-    // list in our main loop but for now, we just want to wait for setup to 
-    // complete before continuing.
-    d3d12_wait_for_previous_frame();
+    // Execute the initialization commands.
+    D3D12_RESOURCE_BARRIER resource_barrier_stencil = {};
+    resource_barrier_stencil.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    resource_barrier_stencil.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    resource_barrier_stencil.Transition.pResource = d3d12_depth_stencil_buffer;
+    resource_barrier_stencil.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    resource_barrier_stencil.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    resource_barrier_stencil.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    
+    d3d12_command_list->ResourceBarrier(1, &resource_barrier_stencil);
+    
+    assert(d3d12_command_list->Close() == 0);
+    ID3D12CommandList *command_lists[] = { d3d12_command_list };
+    d3d12_command_queue->ExecuteCommandLists(array_count(command_lists), command_lists);
+
+    // Wait until initialization is complete.
+    d3d12_flush_command_queue();
   }
 }
 
-internal void d3d12_populate_command_list() {
+internal void d3d12_on_render() {
   // Command list allocators can only be reset when the associated 
   // command lists have finished execution on the GPU; apps should use 
   // fences to determine GPU execution progress.
-  assert(d3d12_command_allocator->Reset() == 0);
+  ID3D12CommandAllocator *command_allocator = d3d12_current_frame_resource->command_list_allocator;
+  assert(command_allocator->Reset() == 0);
     
   // However, when ExecuteCommandList() is called on a particular command 
   // list, that command list can then be reset at any time and must be before 
   // re-recording.
-  assert(d3d12_command_list->Reset(d3d12_command_allocator, d3d12_pipeline_state) == 0);
-    
-  // Set necessary state.
-  d3d12_command_list->SetGraphicsRootSignature(d3d12_signature);
+  assert(d3d12_command_list->Reset(command_allocator, d3d12_pipeline_state) == 0);
 
-  ID3D12DescriptorHeap *heaps[] = { d3d12_cbv_heap };
-  d3d12_command_list->SetDescriptorHeaps(array_count(heaps), heaps);
-  
-  d3d12_command_list->SetGraphicsRootDescriptorTable(0, d3d12_cbv_heap->GetGPUDescriptorHandleForHeapStart());
   d3d12_command_list->RSSetViewports(1, &d3d12_viewport);
   d3d12_command_list->RSSetScissorRects(1, &d3d12_scissor_rect);
     
@@ -529,59 +1117,104 @@ internal void d3d12_populate_command_list() {
   D3D12_RESOURCE_BARRIER resource_barrier_render_target = {};
   resource_barrier_render_target.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
   resource_barrier_render_target.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-  resource_barrier_render_target.Transition.pResource = d3d12_render_targets[d3d12_frame_index];
+  resource_barrier_render_target.Transition.pResource = d3d12_swap_chain_buffer[d3d12_current_back_buffer];
   resource_barrier_render_target.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
   resource_barrier_render_target.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
   resource_barrier_render_target.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    
+
   // Indicate that the back buffer will be used as a render target.
   d3d12_command_list->ResourceBarrier(1, &resource_barrier_render_target);
-    
+
   D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = {};
-  rtv_handle.ptr = d3d12_rtv_heap->GetCPUDescriptorHandleForHeapStart().ptr + (d3d12_frame_index * d3d12_rtv_descriptor_size);
-  d3d12_command_list->OMSetRenderTargets(1, &rtv_handle, FALSE, NULL);
-    
-  // Record commands
+  rtv_handle.ptr = d3d12_rtv_heap->GetCPUDescriptorHandleForHeapStart().ptr + (d3d12_current_back_buffer * d3d12_rtv_descriptor_size);
   v4 clear_color = V4(0.0f, 0.2f, 0.4f, 1.0f);
   d3d12_command_list->ClearRenderTargetView(rtv_handle, clear_color.E, 0, NULL);
-  d3d12_command_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-  d3d12_command_list->IASetVertexBuffers(0, 1, &d3d12_vertex_buffer_view);
-  d3d12_command_list->DrawInstanced(6, 1, 0, 0);
+
+  D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle = {};
+  dsv_handle.ptr = d3d12_dsv_heap->GetCPUDescriptorHandleForHeapStart().ptr;
+  d3d12_command_list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+
+  d3d12_command_list->OMSetRenderTargets(1, &rtv_handle, TRUE, &dsv_handle);
+
+  ID3D12DescriptorHeap *heaps[] = { d3d12_cbv_heap };
+  d3d12_command_list->SetDescriptorHeaps(array_count(heaps), heaps);
+
+  d3d12_command_list->SetGraphicsRootSignature(d3d12_signature);
+  
+  u32 pass_cbv_index = d3d12_pass_cbv_offset + d3d12_current_frame_resource_index;
+
+  D3D12_GPU_DESCRIPTOR_HANDLE pass_cbv_handle = {};
+  pass_cbv_handle.ptr = d3d12_cbv_heap->GetGPUDescriptorHandleForHeapStart().ptr;
+  pass_cbv_handle.ptr += pass_cbv_index * d3d12_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  d3d12_command_list->SetGraphicsRootDescriptorTable(1, pass_cbv_handle);
+  
+  
+
+  u32 object_buffer_size = (sizeof(d3d12_object_constants) + 255) & ~255;
+  ID3D12Resource* object_upload_buffer = d3d12_current_frame_resource->object_constant_buffer.upload_buffer;
+
+  D3D12_VERTEX_BUFFER_VIEW square_vbv;
+  square_vbv.BufferLocation = mesh_geometry.vertex_buffer_GPU->GetGPUVirtualAddress();
+  square_vbv.StrideInBytes = mesh_geometry.vertex_byte_stride;
+  square_vbv.SizeInBytes = mesh_geometry.vertex_buffer_byte_size;
+
+  D3D12_INDEX_BUFFER_VIEW square_ibv;
+  square_ibv.BufferLocation = mesh_geometry.index_buffer_GPU->GetGPUVirtualAddress();
+  square_ibv.Format = mesh_geometry.index_format;
+  square_ibv.SizeInBytes = mesh_geometry.index_buffer_byte_size;
+  
+  for(u32 i = 0; i < MAX_SQUARES; ++i){
+    d3d12_render_item *square = &d3d12_squares[i];
+
     
+
+    d3d12_command_list->IASetVertexBuffers(0, 1, &square_vbv);
+    d3d12_command_list->IASetIndexBuffer(&square_ibv);
+    d3d12_command_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    // Offset to the constant buffer view in the descriptor heap for this object and frame resource.
+    u32 object_cbv_index = d3d12_current_frame_resource_index * MAX_SQUARES + square->constant_buffer_index;
+    D3D12_GPU_DESCRIPTOR_HANDLE object_cbv_handle = {};
+    object_cbv_handle.ptr = d3d12_cbv_heap->GetGPUDescriptorHandleForHeapStart().ptr;
+    object_cbv_handle.ptr += object_cbv_index * d3d12_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    d3d12_command_list->SetGraphicsRootDescriptorTable(0, object_cbv_handle);
+
+    d3d12_command_list->DrawIndexedInstanced(mesh_geometry.index_count, 1, 0, 0, 0);
+  }
+
   // Indicate that the back buffer will now be used to present.
   D3D12_RESOURCE_BARRIER resource_barrier_present = {};
   resource_barrier_present.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
   resource_barrier_present.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-  resource_barrier_present.Transition.pResource = d3d12_render_targets[d3d12_frame_index];
-  resource_barrier_present.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-  resource_barrier_present.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+  resource_barrier_present.Transition.pResource = d3d12_swap_chain_buffer[d3d12_current_back_buffer];
+  resource_barrier_present.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+  resource_barrier_present.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
   resource_barrier_present.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     
   d3d12_command_list->ResourceBarrier(1, &resource_barrier_present);
     
   assert(d3d12_command_list->Close() == 0);
-}
 
-internal void d3d12_on_render() {
-  // Record all the commands needed to render the scene.
-  d3d12_populate_command_list();
-    
   // Execute the command list.
   ID3D12CommandList *command_lists[] = { d3d12_command_list };
   d3d12_command_queue->ExecuteCommandLists(array_count(command_lists), command_lists);
     
   // Present the frame.
   assert(d3d12_swap_chain->Present(0, 0) == 0);
-    
-  d3d12_wait_for_previous_frame();
+  d3d12_current_back_buffer = (d3d12_current_back_buffer + 1) % BACK_BUFFER_COUNT;
+
+  d3d12_current_frame_resource->fence = ++d3d12_fence_value;
+
+  d3d12_command_queue->Signal(d3d12_fence, d3d12_fence_value);
 }
 
 internal void d3d12_update_square_position(v3 position) {
-  d3d12_constant_buffer_data.offset.x = position.x;
-  d3d12_constant_buffer_data.offset.y = position.y;
-  d3d12_constant_buffer_data.offset.z = position.z;
-  temp_constant_buffer *test = (temp_constant_buffer *)d3d12_cbv_data_begin;
-  memcpy(d3d12_cbv_data_begin, &d3d12_constant_buffer_data, sizeof(d3d12_constant_buffer_data));
+  //d3d12_constant_buffer_data.offset.x = position.x;
+  //d3d12_constant_buffer_data.offset.y = position.y;
+  //d3d12_constant_buffer_data.offset.z = position.z;
+  //temp_constant_buffer *test = (temp_constant_buffer *)d3d12_cbv_data_begin;
+  //memcpy(d3d12_cbv_data_begin, &d3d12_constant_buffer_data, sizeof(d3d12_constant_buffer_data));
 }
 
 internal void win32_process_keyboard_message(game_button_state *new_state, b32 is_down){
@@ -692,19 +1325,12 @@ internal void win32_make_queue(platform_work_queue *queue, uint32 thread_count, 
 }
 
 #define PORT "28976"
-// Time in ms, 60 updates per second.
-#define PACKET_SEND_RATE 16
 
 struct win32_network_connection{
   SOCKET socket;
   struct sockaddr address; // This is the address of the server.
   u32 address_length; // This should just be the same value every time.
 };
-
-// We need some sort of win32_packet.
-// Have our own header set up, first X bytes say what type of message it is.
-// CONNECTING,
-// GAME
 
 // NOTE(Trystan): This gets us a connectionless UDP socket, set to our server.
 internal win32_network_connection win32_socket_init(){
@@ -722,7 +1348,7 @@ internal win32_network_connection win32_socket_init(){
   // 192.168.2.146 My desktop
   // 192.168.20.140 wsl2 ubuntu // This changes at startup RIP
   // 192.168.2.98 8GB pi
-  getaddrinfo("192.168.101.247", PORT, &hints, &server_info);
+  getaddrinfo("172.17.132.247", PORT, &hints, &server_info);
 
   win32_network_connection connection = {};
   
@@ -1041,7 +1667,8 @@ extern "C" int __stdcall WinMainCRTStartup() {
         if(square_position.y < -square_bounding_box.y) square_position.y = -square_bounding_box.y;
 
         d3d12_update_square_position(square_position);
-	
+        
+        d3d12_update();
         d3d12_on_render();
 
         // NOTE(Trystan): We want to send updates to the server 60 times a second.

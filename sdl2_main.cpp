@@ -243,6 +243,7 @@ extern "C" int __stdcall WinMainCRTStartup() {
 
   f32 time_since_last_sent_packet = 0.0f;
   f32 time_since_last_received_packet = 0.0f;
+  f32 packet_delay = 0.167f;
 
   u64 last_received_packet_number = 0;
 
@@ -282,6 +283,7 @@ extern "C" int __stdcall WinMainCRTStartup() {
 
     int wait_condition = win32_socket_wait(&connection, 0);
     if(wait_condition){
+      packet_delay = time_since_last_received_packet;
       time_since_last_received_packet = 0.0f;
       network_buffer buffer = {};
       win32_get_raw_packet_data(&connection, &buffer);
@@ -371,7 +373,7 @@ extern "C" int __stdcall WinMainCRTStartup() {
       if(lerp_percent < 1.0f){
         peer_x = Lerp(old_server_data.player_info[i].x, lerp_percent, new_server_data.player_info[i].x);
         peer_y = Lerp(old_server_data.player_info[i].y, lerp_percent, new_server_data.player_info[i].y);
-        lerp_percent += (new_input->dt_for_frame / 0.167f);
+        lerp_percent += (new_input->dt_for_frame / packet_delay);
         if(lerp_percent > 1.0f) lerp_percent = 1.0f;
       }
       

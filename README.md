@@ -1,4 +1,4 @@
-## Simple Multiplayer Game
+## Multiplayer Game
 A player opens the program, gets a square that they can control, and sees other player's squares move in real time.
 That's it.
 
